@@ -51,7 +51,7 @@ pub struct TimerDriverBase<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize>
     slab: A,
     id_alloc: u64,
     now: crate::TimePoint,
-    slots: [[ElemIndex; 1 << PAGE_BITS]; PAGE],
+    slots: [[TimerPageSlot; 1 << PAGE_BITS]; PAGE],
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -61,6 +61,21 @@ pub struct TimerNode<T> {
     expiration: TimePoint,
     next: u32,
     prev: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimerPageSlot {
+    head: ElemIndex,
+    tail: ElemIndex,
+}
+
+impl Default for TimerPageSlot {
+    fn default() -> Self {
+        Self {
+            head: ELEM_NIL,
+            tail: ELEM_NIL,
+        }
+    }
 }
 
 impl<T, A, const PAGE: usize> Default for TimerDriverBase<T, A, PAGE>
@@ -80,7 +95,7 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
             slab,
             id_alloc: 0,
             now: 0,
-            slots: [[ELEM_NIL; 1 << PAGE_BITS]; PAGE],
+            slots: [[Default::default(); 1 << PAGE_BITS]; PAGE],
             _phantom: Default::default(),
         }
     }
@@ -93,7 +108,7 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
     /// - Active timer instance is larger than 2^32-1
     pub fn insert(&mut self, value: T, expires_at: TimePoint) -> TimerHandle {
         let (page, slot_index) = self.page_and_slot(expires_at);
-        let slot_head = self.slots[page][slot_index];
+        let slot = self.slots[page][slot_index];
 
         let node = TimerNode {
             value,
@@ -103,15 +118,23 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
                 NonZeroU64::new(self.id_alloc).unwrap()
             },
             expiration: expires_at,
-            next: slot_head,
+            next: slot.head,
             prev: ELEM_NIL,
         };
 
         let id = node.id.get();
         let new_node = self.slab.insert(node);
-        self.slots[page][slot_index] = new_node;
 
-        if let Some(prev_node) = self.slab.get_mut(slot_head) {
+        {
+            let slot = &mut self.slots[page][slot_index];
+            slot.head = new_node;
+
+            if slot.tail == ELEM_NIL {
+                slot.tail = new_node;
+            }
+        }
+
+        if let Some(prev_node) = self.slab.get_mut(slot.head) {
             prev_node.prev = new_node;
         }
 
@@ -144,18 +167,20 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
         let prev = node.prev;
         let next = node.next;
         let node_expire_at = node.expiration;
+        let (page, slot_index) = self.page_and_slot(node_expire_at);
 
         if let Some(prev_node) = self.slab.get_mut(prev) {
             prev_node.next = next;
         } else {
-            let (page, slot_index) = self.page_and_slot(node_expire_at);
-            debug_assert_eq!(self.slots[page][slot_index], handle.index());
-
-            self.slots[page][slot_index] = next;
+            debug_assert_eq!(self.slots[page][slot_index].head, handle.index());
+            self.slots[page][slot_index].head = next;
         }
 
         if let Some(next_node) = self.slab.get_mut(next) {
             next_node.prev = prev;
+        } else {
+            debug_assert_eq!(self.slots[page][slot_index].tail, handle.index());
+            self.slots[page][slot_index].tail = prev;
         }
 
         Some(self.slab.remove(handle.index()).value)
@@ -180,6 +205,19 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
     /// point doesn't cause panic, as it's meaningful for timer insertions that are
     /// *already expired*.
     pub fn advance(&mut self, now: TimePoint) -> TimerDriverDrainIter<T, A, PAGE> {
+        // TODO: Detect all cursor advances
+        let mut expired_head = ELEM_NIL;
+        let mut diff = now.checked_sub(self.now).expect("time advanced backward!");
+
+        // For the first page, it works as plain hashed wheel
+        {
+            let mut advances = diff & PAGE_MASK;
+            diff &= !PAGE_MASK; // Clear first page advances
+        }
+
+        // TODO: Collect all expired nodes and put it to returned iterator, which will
+        // dispose all expired + un-drained nodes when dropped.
+
         todo!()
     }
 }
