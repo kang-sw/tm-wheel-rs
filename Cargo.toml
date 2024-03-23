@@ -1,0 +1,16 @@
+[package]
+name = "timey"
+version = "0.1.0"
+edition = "2021"
+description = "A simple timer driver"
+license = "MIT"
+authors = ["kang-sw <ki6080@gmail.com>"]
+categories = ["embedded", "no-std", "timer"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+slab = { version = "0.4", optional = true }
+
+[features]
+std = ["dep:slab"]
