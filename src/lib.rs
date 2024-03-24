@@ -43,7 +43,7 @@ type TimerGenId = u64;
 
 type ElemIndex = u32;
 const ELEM_NIL: ElemIndex = u32::MAX;
-const PAGE_BITS: usize = 4;
+const PAGE_BITS: usize = 6;
 const PAGE_MASK: u64 = (1 << PAGE_BITS) - 1;
 
 /// Basic timer driver with manually configurable page size / slab allocator.
@@ -199,25 +199,85 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
 
     /// Advance timer driver to the given time point.
     ///
+    /// # Warning
+    ///
+    /// Expiration order is not guaranteed. It's caller's responsibility to handle
+    /// correct expiration order.
+    ///
     /// # Panics
     ///
     /// Panics if the given time point is less than the current time point. Same time
     /// point doesn't cause panic, as it's meaningful for timer insertions that are
     /// *already expired*.
     pub fn advance(&mut self, now: TimePoint) -> TimerDriverDrainIter<T, A, PAGE> {
+        assert!(now >= self.now, "time advanced backward!");
+
         // TODO: Detect all cursor advances
         let mut expired_head = ELEM_NIL;
-        let mut diff = now.checked_sub(self.now).expect("time advanced backward!");
 
-        // For the first page, it works as plain hashed wheel
+        // TODO: Rehash all upward timers to the downward slots
         {
-            let mut advances = diff & PAGE_MASK;
-            diff &= !PAGE_MASK; // Clear first page advances
+            // A linked list of rehashed nodes.
+            let mut rehash_head = ELEM_NIL;
+            let mut update_bits = self.now ^ now & !PAGE_MASK;
+            //                       Exclude lowest page ^^^^^^^^^
+
+            while update_bits != 0 {
+                let msb_idx = 63_u32.saturating_sub(update_bits.leading_zeros());
+                let page_idx = msb_idx as usize / PAGE_BITS;
+
+                // Mark given page as handled.
+                let bit_offset = page_idx * PAGE_BITS;
+                update_bits &= !(PAGE_MASK << bit_offset);
+
+                // Select all items to be rehashed.
+                let page = &mut self.slots[page_idx];
+                let mut cursor = (self.now >> bit_offset) & PAGE_MASK;
+                let dst_cursor = (now >> bit_offset) & PAGE_MASK;
+
+                while dst_cursor != cursor {
+                    let slot = &mut page[cursor as usize];
+
+                    if slot.tail != ELEM_NIL {
+                        debug_assert_ne!(slot.head, ELEM_NIL);
+
+                        // Append all nodes in slot to rehash list.
+                        Self::link_back_mono(&mut self.slab, slot.tail, rehash_head);
+                        rehash_head = slot.head;
+
+                        // Clear slot
+                        slot.head = ELEM_NIL;
+                        slot.tail = ELEM_NIL;
+                    }
+
+                    // Rotate cursor within wrapped range.
+                    cursor = (cursor + 1) & PAGE_MASK;
+                }
+            }
+
+            // Rehash all
+            while rehash_head != ELEM_NIL {
+                rehash_head += 1;
+                todo!()
+            }
         }
+
+        // TODO: At page 0, advance cursor and expire timers.
 
         // TODO: Collect all expired nodes and put it to returned iterator, which will
         // dispose all expired + un-drained nodes when dropped.
 
+        // Update time point
+        self.now = now;
+
+        TimerDriverDrainIter {
+            driver: self,
+            head: expired_head,
+        }
+    }
+
+    /// Create mono-directional link from `base` to `node`.
+    fn link_back_mono(slab: &mut A, base: ElemIndex, node: ElemIndex) {
         todo!()
     }
 }
