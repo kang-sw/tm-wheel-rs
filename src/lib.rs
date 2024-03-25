@@ -108,7 +108,7 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
     /// - Active timer instance is larger than 2^32-1
     pub fn insert(&mut self, value: T, expires_at: TimePoint) -> TimerHandle {
         let (page, slot_index) = self.page_and_slot(expires_at);
-        let slot = self.slots[page][slot_index];
+        let slot = &mut self.slots[page][slot_index];
 
         let node = TimerNode {
             value,
@@ -125,20 +125,20 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
         let id = node.id.get();
         let new_node = self.slab.insert(node);
 
-        {
-            let slot = &mut self.slots[page][slot_index];
-            slot.head = new_node;
-
-            if slot.tail == ELEM_NIL {
-                slot.tail = new_node;
-            }
-        }
-
-        if let Some(prev_node) = self.slab.get_mut(slot.head) {
-            prev_node.prev = new_node;
-        }
-
+        Self::link_node_to_slot(&mut self.slab, slot, new_node);
         TimerHandle(id, NonZeroU32::new(new_node + 1).unwrap())
+    }
+
+    fn link_node_to_slot(slab: &mut A, slot: &mut TimerPageSlot, node_idx: ElemIndex) {
+        if slot.head == ELEM_NIL {
+            slot.tail = node_idx;
+        } else {
+            let head = slot.head;
+            let head_node = slab.get_mut(head).unwrap();
+            head_node.prev = node_idx;
+        }
+
+        slot.head = node_idx;
     }
 
     fn page_and_slot(&self, expires_at: TimePoint) -> (usize, usize) {
@@ -164,26 +164,35 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
             return None;
         }
 
-        let prev = node.prev;
-        let next = node.next;
         let node_expire_at = node.expiration;
         let (page, slot_index) = self.page_and_slot(node_expire_at);
 
-        if let Some(prev_node) = self.slab.get_mut(prev) {
-            prev_node.next = next;
-        } else {
-            debug_assert_eq!(self.slots[page][slot_index].head, handle.index());
-            self.slots[page][slot_index].head = next;
-        }
-
-        if let Some(next_node) = self.slab.get_mut(next) {
-            next_node.prev = prev;
-        } else {
-            debug_assert_eq!(self.slots[page][slot_index].tail, handle.index());
-            self.slots[page][slot_index].tail = prev;
-        }
+        let slot = &mut self.slots[page][slot_index];
+        Self::unlink(&mut self.slab, slot, handle.index());
 
         Some(self.slab.remove(handle.index()).value)
+    }
+
+    fn unlink(slab: &mut A, slot: &mut TimerPageSlot, node_idx: ElemIndex) {
+        let node = slab.get(node_idx).unwrap();
+        let prev = node.prev;
+        let next = node.next;
+
+        if prev != ELEM_NIL {
+            let prev_node = slab.get_mut(prev).unwrap();
+            prev_node.next = next;
+        } else {
+            debug_assert_eq!(slot.head, node_idx);
+            slot.head = next;
+        }
+
+        if next != ELEM_NIL {
+            let next_node = slab.get_mut(next).unwrap();
+            next_node.prev = prev;
+        } else {
+            debug_assert_eq!(slot.tail, node_idx);
+            slot.tail = prev;
+        }
     }
 
     /// Remove all timers.
