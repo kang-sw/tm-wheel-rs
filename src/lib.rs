@@ -43,15 +43,18 @@ type TimerGenId = u64;
 
 type ElemIndex = u32;
 const ELEM_NIL: ElemIndex = u32::MAX;
-const PAGE_BITS: usize = 6;
-const PAGE_MASK: u64 = (1 << PAGE_BITS) - 1;
 
 /// Basic timer driver with manually configurable page size / slab allocator.
-pub struct TimerDriverBase<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> {
+pub struct TimerDriverBase<
+    T,
+    A: SlapAllocator<TimerNode<T>>,
+    const PAGES: usize,
+    const PAGE_SIZE: usize,
+> {
     slab: A,
     id_alloc: u64,
     now: crate::TimePoint,
-    slots: [[TimerPageSlot; 1 << PAGE_BITS]; PAGE],
+    slots: [[TimerPageSlot; PAGE_SIZE]; PAGES],
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -78,7 +81,8 @@ impl Default for TimerPageSlot {
     }
 }
 
-impl<T, A, const PAGE: usize> Default for TimerDriverBase<T, A, PAGE>
+impl<T, A, const PAGES: usize, const PAGE_SIZE: usize> Default
+    for TimerDriverBase<T, A, PAGES, PAGE_SIZE>
 where
     A: SlapAllocator<TimerNode<T>> + Default,
 {
@@ -87,15 +91,21 @@ where
     }
 }
 
-impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A, PAGE> {
-    pub const PAGES: usize = PAGE;
+impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usize>
+    TimerDriverBase<T, A, PAGES, PAGE_SIZE>
+{
+    pub const PAGES: usize = PAGES;
+    const BITS: usize = PAGE_SIZE.trailing_zeros() as usize;
+    const MASK: u64 = PAGE_SIZE as u64 - 1;
 
     pub fn new(slab: A) -> Self {
+        debug_assert!(PAGE_SIZE.is_power_of_two());
+
         Self {
             slab,
             id_alloc: 0,
             now: 0,
-            slots: [[Default::default(); 1 << PAGE_BITS]; PAGE],
+            slots: [[Default::default(); PAGE_SIZE]; PAGES],
             _phantom: Default::default(),
         }
     }
@@ -144,16 +154,16 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
     fn page_and_slot(&self, expires_at: TimePoint) -> (usize, usize) {
         let offset = expires_at.saturating_sub(self.now);
         let msb_idx = 63_u32.saturating_sub(offset.leading_zeros());
-        let page = msb_idx as usize / PAGE_BITS;
-        let cursor = self.now >> PAGE_BITS;
-        let cursor_offset = offset >> (page * PAGE_BITS);
-        let slot_index = (cursor + cursor_offset) & PAGE_MASK;
+        let page = msb_idx as usize / Self::BITS;
+        let cursor = self.now >> Self::BITS;
+        let cursor_offset = offset >> (page * Self::BITS);
+        let slot_index = (cursor + cursor_offset) & Self::MASK;
 
         (page, slot_index as usize)
     }
 
     pub fn expiration_limit(&self) -> TimePoint {
-        1 << (PAGE * PAGE_BITS)
+        1 << (PAGES * Self::BITS)
     }
 
     ///
@@ -202,7 +212,7 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
 
     /// Drain all timers. Prefer [`TimerDriverBase::clear`] if you don't need the drained
     /// values.
-    pub fn drain(&mut self) -> TimerDriverDrainIter<T, A, PAGE> {
+    pub fn drain(&mut self) -> TimerDriverDrainIter<T, A, PAGES, PAGE_SIZE> {
         todo!()
     }
 
@@ -218,7 +228,7 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
     /// Panics if the given time point is less than the current time point. Same time
     /// point doesn't cause panic, as it's meaningful for timer insertions that are
     /// *already expired*.
-    pub fn advance(&mut self, now: TimePoint) -> TimerDriverDrainIter<T, A, PAGE> {
+    pub fn advance(&mut self, now: TimePoint) -> TimerDriverDrainIter<T, A, PAGES, PAGE_SIZE> {
         assert!(now >= self.now, "time advanced backward!");
 
         // TODO: Detect all cursor advances
@@ -228,7 +238,7 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
 
         // From highest changed page ...
         let bit_diff = self.now ^ now;
-        let page = 63_u64.saturating_sub(bit_diff.leading_zeros() as _) as usize / PAGE_BITS;
+        let page = 63_u64.saturating_sub(bit_diff.leading_zeros() as _) as usize / Self::BITS;
         let time_diff = now - self.now;
 
         for page in (0..=page).rev() {
@@ -237,12 +247,12 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
             // - Timer advance was just normal, as bit difference tracking is enough.
 
             // Check if it's the first case ...
-            let page_max = PAGE_MASK << (page * PAGE_BITS);
-            let cursor = (self.now >> (page * PAGE_BITS)) & PAGE_MASK;
+            let page_max = Self::MASK << (page * Self::BITS);
+            let cursor = (self.now >> (page * Self::BITS)) & Self::MASK;
             let dst_cursor = if time_diff > page_max {
-                (cursor + PAGE_MASK) & PAGE_MASK
+                (cursor + Self::MASK) & Self::MASK
             } else {
-                (now >> (page * PAGE_BITS)) & PAGE_MASK
+                (now >> (page * Self::BITS)) & Self::MASK
             };
 
             // Until cursor reaches dst_cursor, rehash all nodes to the downward pages.
@@ -303,7 +313,13 @@ impl TimerHandle {
 /*                                            ITERATOR                                            */
 /* ============================================================================================== */
 
-pub struct TimerDriverDrainIter<'a, T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> {
-    driver: &'a mut TimerDriverBase<T, A, PAGE>,
+pub struct TimerDriverDrainIter<
+    'a,
+    T,
+    A: SlapAllocator<TimerNode<T>>,
+    const PAGES: usize,
+    const PAGE_SIZE: usize,
+> {
+    driver: &'a mut TimerDriverBase<T, A, PAGES, PAGE_SIZE>,
     head: u32,
 }
