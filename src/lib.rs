@@ -95,7 +95,7 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
     TimerDriverBase<T, A, PAGES, PAGE_SIZE>
 {
     pub const PAGES: usize = PAGES;
-    const BITS: usize = PAGE_SIZE.trailing_zeros() as usize;
+    const BITS: usize = PAGE_SIZE.next_power_of_two();
     const MASK: u64 = PAGE_SIZE as u64 - 1;
 
     pub fn new(slab: A) -> Self {
@@ -232,7 +232,7 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         assert!(now >= self.now, "time advanced backward!");
 
         // TODO: Detect all cursor advances
-        let mut expired_head = ELEM_NIL;
+        let mut rehash_head = ELEM_NIL;
 
         // TODO: Rehash all upward timers to the downward slots
 
@@ -248,7 +248,7 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
 
             // Check if it's the first case ...
             let page_max = Self::MASK << (page * Self::BITS);
-            let cursor = (self.now >> (page * Self::BITS)) & Self::MASK;
+            let mut cursor = (self.now >> (page * Self::BITS)) & Self::MASK;
             let dst_cursor = if time_diff > page_max {
                 (cursor + Self::MASK) & Self::MASK
             } else {
@@ -256,25 +256,40 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
             };
 
             // Until cursor reaches dst_cursor, rehash all nodes to the downward pages.
+            while cursor != dst_cursor {
+                // Push to rehash candidate.
+                let slot = &mut self.slots[page][cursor as usize];
+
+                if slot.tail == ELEM_NIL {
+                    debug_assert_eq!(slot.head, ELEM_NIL);
+                    continue;
+                }
+
+                let node = self.slab.get_mut(slot.tail).unwrap();
+
+                // Just create incomplete link, as we're going to rehash them all
+                // immediately.
+                node.next = rehash_head;
+                slot.head = ELEM_NIL;
+                slot.tail = ELEM_NIL;
+
+                // Cursor rotation.
+                cursor = (cursor + 1) & Self::MASK;
+            }
         }
 
         // TODO: At page 0, advance cursor and expire timers.
 
         // TODO: Collect all expired nodes and put it to returned iterator, which will
         // dispose all expired + un-drained nodes when dropped.
+        let mut expired_head = ELEM_NIL; // TODO
 
-        // Update time point
         self.now = now;
 
         TimerDriverDrainIter {
             driver: self,
             head: expired_head,
         }
-    }
-
-    /// Create mono-directional link from `base` to `node`.
-    fn link_back_mono(slab: &mut A, base: ElemIndex, node: ElemIndex) {
-        todo!()
     }
 }
 
