@@ -225,50 +225,27 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGE: usize> TimerDriverBase<T, A,
         let mut expired_head = ELEM_NIL;
 
         // TODO: Rehash all upward timers to the downward slots
-        {
-            // A linked list of rehashed nodes.
-            let mut rehash_head = ELEM_NIL;
-            let mut update_bits = self.now ^ now & !PAGE_MASK;
-            //                       Exclude lowest page ^^^^^^^^^
 
-            while update_bits != 0 {
-                let msb_idx = 63_u32.saturating_sub(update_bits.leading_zeros());
-                let page_idx = msb_idx as usize / PAGE_BITS;
+        // From highest changed page ...
+        let bit_diff = self.now ^ now;
+        let page = 63_u64.saturating_sub(bit_diff.leading_zeros() as _) as usize / PAGE_BITS;
+        let time_diff = now - self.now;
 
-                // Mark given page as handled.
-                let bit_offset = page_idx * PAGE_BITS;
-                update_bits &= !(PAGE_MASK << bit_offset);
+        for page in (0..=page).rev() {
+            // check how many cursors need to be advanced. There's two cases:
+            // - Timer advance was 'very large', which just rotated all page by once.
+            // - Timer advance was just normal, as bit difference tracking is enough.
 
-                // Select all items to be rehashed.
-                let page = &mut self.slots[page_idx];
-                let mut cursor = (self.now >> bit_offset) & PAGE_MASK;
-                let dst_cursor = (now >> bit_offset) & PAGE_MASK;
+            // Check if it's the first case ...
+            let page_max = PAGE_MASK << (page * PAGE_BITS);
+            let cursor = (self.now >> (page * PAGE_BITS)) & PAGE_MASK;
+            let dst_cursor = if time_diff > page_max {
+                (cursor + PAGE_MASK) & PAGE_MASK
+            } else {
+                (now >> (page * PAGE_BITS)) & PAGE_MASK
+            };
 
-                while dst_cursor != cursor {
-                    let slot = &mut page[cursor as usize];
-
-                    if slot.tail != ELEM_NIL {
-                        debug_assert_ne!(slot.head, ELEM_NIL);
-
-                        // Append all nodes in slot to rehash list.
-                        Self::link_back_mono(&mut self.slab, slot.tail, rehash_head);
-                        rehash_head = slot.head;
-
-                        // Clear slot
-                        slot.head = ELEM_NIL;
-                        slot.tail = ELEM_NIL;
-                    }
-
-                    // Rotate cursor within wrapped range.
-                    cursor = (cursor + 1) & PAGE_MASK;
-                }
-            }
-
-            // Rehash all
-            while rehash_head != ELEM_NIL {
-                rehash_head += 1;
-                todo!()
-            }
+            // Until cursor reaches dst_cursor, rehash all nodes to the downward pages.
         }
 
         // TODO: At page 0, advance cursor and expire timers.
