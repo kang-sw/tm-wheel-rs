@@ -238,17 +238,19 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
 
         // From highest changed page ...
         let bit_diff = self.now ^ now;
-        let page = 63_u64.saturating_sub(bit_diff.leading_zeros() as _) as usize / Self::BITS;
+        let page_hi = 63_usize.saturating_sub(bit_diff.leading_zeros() as _) / Self::BITS;
         let time_diff = now - self.now;
 
-        for page in (0..=page).rev() {
-            // check how many cursors need to be advanced. There's two cases:
-            // - Timer advance was 'very large', which just rotated all page by once.
-            // - Timer advance was just normal, as bit difference tracking is enough.
-
+        for page in (0..=page_hi).rev() {
             // Check if it's the first case ...
             let page_max = Self::MASK << (page * Self::BITS);
             let mut cursor = (self.now >> (page * Self::BITS)) & Self::MASK;
+
+            // There might be an edge case where the amount by which the timer advances is
+            // exceptionally large. in such a scenario, we cannot merely compare the
+            // cursor position using the masked bit hash, as it could potentially undergo
+            // a complete rotation. for instance, even if the cursor position remains the
+            // same, all timers on the page might have expired.
             let dst_cursor = if time_diff > page_max {
                 (cursor + Self::MASK) & Self::MASK
             } else {
