@@ -117,7 +117,7 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
     /// - Specified timer expiration is out of range.
     /// - Active timer instance is larger than 2^32-1
     pub fn insert(&mut self, value: T, expires_at: TimePoint) -> TimerHandle {
-        let (page, slot_index) = self.page_and_slot(expires_at);
+        let (page, slot_index) = Self::page_and_slot(self.now, expires_at);
         let slot = &mut self.slots[page][slot_index];
 
         let node = TimerNode {
@@ -135,11 +135,11 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         let id = node.id.get();
         let new_node = self.slab.insert(node);
 
-        Self::link_node_to_slot(&mut self.slab, slot, new_node);
+        Self::assign_node_to_slot_front(&mut self.slab, slot, new_node);
         TimerHandle(id, NonZeroU32::new(new_node + 1).unwrap())
     }
 
-    fn link_node_to_slot(slab: &mut A, slot: &mut TimerPageSlot, node_idx: ElemIndex) {
+    fn assign_node_to_slot_front(slab: &mut A, slot: &mut TimerPageSlot, node_idx: ElemIndex) {
         if slot.head == ELEM_NIL {
             slot.tail = node_idx;
         } else {
@@ -151,11 +151,11 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         slot.head = node_idx;
     }
 
-    fn page_and_slot(&self, expires_at: TimePoint) -> (usize, usize) {
-        let offset = expires_at.saturating_sub(self.now);
+    fn page_and_slot(now: TimePoint, expires_at: TimePoint) -> (usize, usize) {
+        let offset = expires_at.saturating_sub(now);
         let msb_idx = 63_u32.saturating_sub(offset.leading_zeros());
         let page = msb_idx as usize / Self::BITS;
-        let cursor = self.now >> Self::BITS;
+        let cursor = now >> Self::BITS;
         let cursor_offset = offset >> (page * Self::BITS);
         let slot_index = (cursor + cursor_offset) & Self::MASK;
 
@@ -175,7 +175,7 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         }
 
         let node_expire_at = node.expiration;
-        let (page, slot_index) = self.page_and_slot(node_expire_at);
+        let (page, slot_index) = Self::page_and_slot(self.now, node_expire_at);
 
         let slot = &mut self.slots[page][slot_index];
         Self::unlink(&mut self.slab, slot, handle.index());
@@ -241,7 +241,9 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         let page_hi = 63_usize.saturating_sub(bit_diff.leading_zeros() as _) / Self::BITS;
         let time_diff = now - self.now;
 
-        for page in (0..=page_hi).rev() {
+        for page in (1..=page_hi).rev() {
+            //              ^ Exclude first page.
+
             // Check if it's the first case ...
             let page_max = Self::MASK << (page * Self::BITS);
             let mut cursor = (self.now >> (page * Self::BITS)) & Self::MASK;
@@ -275,12 +277,25 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
                 slot.head = ELEM_NIL;
                 slot.tail = ELEM_NIL;
 
-                // Cursor rotation.
                 cursor = (cursor + 1) & Self::MASK;
             }
         }
 
-        // TODO: At page 0, advance cursor and expire timers.
+        // Rehash all timers
+        while rehash_head != ELEM_NIL {
+            let node_idx = rehash_head;
+            let node = self.slab.get_mut(node_idx).unwrap();
+            rehash_head = node.next;
+
+            let expiration = node.expiration.max(now);
+            let (page, slot_index) = Self::page_and_slot(self.now, expiration);
+
+            let slot = &mut self.slots[page][slot_index];
+            node.prev = ELEM_NIL;
+            node.next = slot.head;
+
+            Self::assign_node_to_slot_front(&mut self.slab, slot, node_idx)
+        }
 
         // TODO: Collect all expired nodes and put it to returned iterator, which will
         // dispose all expired + un-drained nodes when dropped.
