@@ -4,12 +4,48 @@ use core::{
 };
 
 #[cfg(feature = "std")]
-mod _std {}
+mod _std {
+    impl<T> super::SlabAllocator<T> for slab::Slab<T> {
+        fn insert(&mut self, value: T) -> u32 {
+            self.insert(value) as _
+        }
+
+        fn remove(&mut self, key: u32) -> T {
+            self.remove(key as _)
+        }
+
+        fn get(&self, key: u32) -> Option<&T> {
+            self.get(key as _)
+        }
+
+        fn get_mut(&mut self, key: u32) -> Option<&mut T> {
+            self.get_mut(key as _)
+        }
+
+        fn clear(&mut self) {
+            self.clear();
+        }
+
+        fn len(&self) -> usize {
+            self.len()
+        }
+
+        fn reserve(&mut self, additional: usize) {
+            self.reserve(additional);
+        }
+    }
+
+    pub type TimerDriver<T, const PAGES: usize, const PAGE_SIZE: usize> =
+        super::TimerDriverBase<T, slab::Slab<super::TimerNode<T>>, PAGES, PAGE_SIZE>;
+}
+
+#[cfg(feature = "std")]
+pub use _std::*;
 
 /* -------------------------------------------- Trait ------------------------------------------- */
 
 /// A backend allocator for [`TimerDriverBase`].
-pub trait SlapAllocator<T> {
+pub trait SlabAllocator<T> {
     /// # Panics
     ///
     /// Panics if the key is not found
@@ -29,10 +65,21 @@ pub trait SlapAllocator<T> {
     /// Clear all elements.
     fn clear(&mut self);
 
-    /// # Safety
+    /// Reserve extra space than `len()` for slab.
     ///
-    /// The caller must ensure that all keys are valid and disjoint each other.
-    unsafe fn get_many_mut_unchecked<const N: usize>(&mut self, keys: [u32; N]) -> [&mut T; N];
+    /// For unsupported slab implementations(e.g. for embedded slabs), this method
+    /// just does nothing.
+    fn reserve(&mut self, additional: usize) {
+        let _ = additional;
+    }
+
+    /// Get the number of elements.
+    fn len(&self) -> usize;
+
+    /// Check if slab allocator is empty
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /* ============================================================================================== */
@@ -50,7 +97,7 @@ const ELEM_NIL: ElemIndex = u32::MAX;
 /// Basic timer driver with manually configurable page size / slab allocator.
 pub struct TimerDriverBase<
     T,
-    A: SlapAllocator<TimerNode<T>>,
+    A: SlabAllocator<TimerNode<T>>,
     const PAGES: usize,
     const PAGE_SIZE: usize,
 > {
@@ -87,14 +134,14 @@ impl Default for TimerPageSlot {
 impl<T, A, const PAGES: usize, const PAGE_SIZE: usize> Default
     for TimerDriverBase<T, A, PAGES, PAGE_SIZE>
 where
-    A: SlapAllocator<TimerNode<T>> + Default,
+    A: SlabAllocator<TimerNode<T>> + Default,
 {
     fn default() -> Self {
         Self::new(A::default())
     }
 }
 
-impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usize>
+impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usize>
     TimerDriverBase<T, A, PAGES, PAGE_SIZE>
 {
     pub const PAGES: usize = PAGES;
@@ -167,11 +214,13 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         (page, slot_index as usize)
     }
 
-    pub fn expiration_limit(&self) -> TimePoint {
+    /// Get the maximum amount of time that can be set for a timer. Returned value is
+    /// offset time from the current time point.
+    pub fn expiration_limit(&self) -> u64 {
         1 << (PAGES * Self::BITS)
     }
 
-    ///
+    /// Remove given timer handle from the driver.
     pub fn remove(&mut self, handle: TimerHandle) -> Option<T> {
         let node = self.slab.get(handle.index())?;
 
@@ -210,9 +259,31 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         }
     }
 
-    /// Remove all timers.
-    pub fn clear(&mut self) {
+    /// Get the number of registered timers.
+    pub fn len(&self) -> usize {
+        self.slab.len()
+    }
+
+    /// Check if the driver is empty.
+    pub fn is_empty(&self) -> bool {
+        self.slab.is_empty()
+    }
+
+    /// Get the current time point.
+    pub fn now(&self) -> TimePoint {
+        self.now
+    }
+
+    /// Reserve the space for additional timers. If underlying [`SlabAllocator`] doesn't
+    /// support it, this method does nothing.
+    pub fn reserve(&mut self, additional: usize) {
+        self.slab.reserve(additional);
+    }
+
+    /// Remove all timers. Time point regression is only allowed if the driver is empty.
+    pub fn reset(&mut self, now: TimePoint) {
         self.slab.clear();
+        self.now = now;
     }
 
     /// Drain all timers. Prefer [`TimerDriverBase::clear`] if you don't need the drained
@@ -246,8 +317,6 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         let time_diff = now - self.now;
 
         for page in (0..=page_hi).rev() {
-            //                           ^^^ Let it merge down to lowest page.
-
             // There might be an edge case where the amount by which the timer advances is
             // exceptionally large. in such a scenario, we cannot merely compare the
             // cursor position using the masked bit hash, as it could potentially undergo
@@ -356,11 +425,45 @@ impl TimerHandle {
 pub struct TimerDriverDrainIter<
     'a,
     T,
-    A: SlapAllocator<TimerNode<T>>,
+    A: SlabAllocator<TimerNode<T>>,
     const PAGES: usize,
     const PAGE_SIZE: usize,
 > {
     driver: &'a mut TimerDriverBase<T, A, PAGES, PAGE_SIZE>,
     head: u32,
     tail: u32,
+}
+
+/* ============================================================================================== */
+/*                                              TESTS                                             */
+/* ============================================================================================== */
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use crate::TimePoint;
+
+    #[test]
+    fn test_insertion_and_structure_validity() {
+        let mut tm = crate::TimerDriver::<u32, 4, 16>::default();
+        let mut idx = {
+            let mut gen = 0;
+            move || {
+                gen += 1;
+                gen
+            }
+        };
+
+        // Should be hashed to page 0, slot 10
+        let mut insert_and_compare = |expire: TimePoint, page: usize, slot: usize| {
+            let h = tm.insert(idx(), expire);
+            assert_eq!(tm.slots[page][slot].head, h.index());
+        };
+
+        insert_and_compare(10, 0, 10);
+        insert_and_compare(20, 1, 1);
+        insert_and_compare(30, 1, 1);
+        insert_and_compare(40, 1, 2);
+        insert_and_compare(50, 1, 3);
+        insert_and_compare(60, 1, 3);
+        insert_and_compare(257, 2, 1);
+    }
 }
