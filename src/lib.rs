@@ -1,4 +1,7 @@
-use core::num::{NonZeroU32, NonZeroU64};
+use core::{
+    mem::replace,
+    num::{NonZeroU32, NonZeroU64},
+};
 
 #[cfg(feature = "std")]
 mod _std {}
@@ -140,6 +143,8 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
     }
 
     fn assign_node_to_slot_front(slab: &mut A, slot: &mut TimerPageSlot, node_idx: ElemIndex) {
+        debug_assert!(slab.get(node_idx).unwrap().next == slot.head);
+
         if slot.head == ELEM_NIL {
             slot.tail = node_idx;
         } else {
@@ -231,81 +236,84 @@ impl<T, A: SlapAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
     pub fn advance(&mut self, now: TimePoint) -> TimerDriverDrainIter<T, A, PAGES, PAGE_SIZE> {
         assert!(now >= self.now, "time advanced backward!");
 
-        // TODO: Detect all cursor advances
-        let mut rehash_head = ELEM_NIL;
-
-        // TODO: Rehash all upward timers to the downward slots
+        // Detect all cursor advances
+        let mut expired_head = ELEM_NIL;
+        let mut expired_tail = ELEM_NIL;
 
         // From highest changed page ...
         let bit_diff = self.now ^ now;
         let page_hi = 63_usize.saturating_sub(bit_diff.leading_zeros() as _) / Self::BITS;
         let time_diff = now - self.now;
 
-        for page in (1..=page_hi).rev() {
-            //              ^ Exclude first page.
-
-            // Check if it's the first case ...
-            let page_max = Self::MASK << (page * Self::BITS);
-            let mut cursor = (self.now >> (page * Self::BITS)) & Self::MASK;
+        for page in (0..=page_hi).rev() {
+            //                           ^^^ Let it merge down to lowest page.
 
             // There might be an edge case where the amount by which the timer advances is
             // exceptionally large. in such a scenario, we cannot merely compare the
             // cursor position using the masked bit hash, as it could potentially undergo
             // a complete rotation. for instance, even if the cursor position remains the
             // same, all timers on the page might have expired.
-            let dst_cursor = if time_diff > page_max {
+            let page_max_time = Self::MASK << (page * Self::BITS);
+            let mut cursor = (self.now >> (page * Self::BITS)) & Self::MASK;
+
+            let dst_cursor = if time_diff > page_max_time {
                 (cursor + Self::MASK) & Self::MASK
             } else {
                 (now >> (page * Self::BITS)) & Self::MASK
             };
 
-            // Until cursor reaches dst_cursor, rehash all nodes to the downward pages.
             while cursor != dst_cursor {
-                // Push to rehash candidate.
                 let slot = &mut self.slots[page][cursor as usize];
+                let mut slot_head = replace(&mut slot.head, ELEM_NIL);
+                let slot_tail = replace(&mut slot.tail, ELEM_NIL);
 
-                if slot.tail == ELEM_NIL {
-                    debug_assert_eq!(slot.head, ELEM_NIL);
-                    continue;
+                if page > 0 {
+                    // Rehash every item within this slot.
+                    while slot_head != slot_tail {
+                        let node_idx = slot_head;
+                        let node = self.slab.get_mut(node_idx).unwrap();
+                        slot_head = node.next;
+
+                        let expiration = node.expiration.max(now);
+                        let (new_page, new_slot) = Self::page_and_slot(now, expiration);
+
+                        let new_slot = &mut self.slots[new_page][new_slot];
+                        node.next = new_slot.head;
+                        Self::assign_node_to_slot_front(&mut self.slab, new_slot, node_idx);
+                    }
+                } else {
+                    if slot_head == ELEM_NIL {
+                        continue;
+                    }
+
+                    // append all expired pages to output expiration list
+                    debug_assert!({ self.slab.get(slot_head).unwrap().expiration < now });
+
+                    if let Some(expired) = self.slab.get_mut(expired_head) {
+                        expired.prev = slot_tail;
+
+                        let tail = self.slab.get_mut(slot_tail).unwrap();
+                        tail.next = expired_head;
+                    }
+
+                    if expired_tail == ELEM_NIL {
+                        expired_tail = slot_tail;
+                    }
+
+                    expired_head = slot_head;
                 }
-
-                let node = self.slab.get_mut(slot.tail).unwrap();
-
-                // Just create incomplete link, as we're going to rehash them all
-                // immediately.
-                node.next = rehash_head;
-                slot.head = ELEM_NIL;
-                slot.tail = ELEM_NIL;
 
                 cursor = (cursor + 1) & Self::MASK;
             }
         }
 
-        // Rehash all timers
-        while rehash_head != ELEM_NIL {
-            let node_idx = rehash_head;
-            let node = self.slab.get_mut(node_idx).unwrap();
-            rehash_head = node.next;
-
-            let expiration = node.expiration.max(now);
-            let (page, slot_index) = Self::page_and_slot(self.now, expiration);
-
-            let slot = &mut self.slots[page][slot_index];
-            node.prev = ELEM_NIL;
-            node.next = slot.head;
-
-            Self::assign_node_to_slot_front(&mut self.slab, slot, node_idx)
-        }
-
-        // TODO: Collect all expired nodes and put it to returned iterator, which will
-        // dispose all expired + un-drained nodes when dropped.
-        let mut expired_head = ELEM_NIL; // TODO
-
+        // update timings
         self.now = now;
 
         TimerDriverDrainIter {
             driver: self,
             head: expired_head,
+            tail: expired_tail,
         }
     }
 }
@@ -354,4 +362,5 @@ pub struct TimerDriverDrainIter<
 > {
     driver: &'a mut TimerDriverBase<T, A, PAGES, PAGE_SIZE>,
     head: u32,
+    tail: u32,
 }
