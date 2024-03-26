@@ -558,19 +558,41 @@ mod tests {
         tm.insert(2, 1020);
         tm.insert(3, 1030);
 
-        {
-            let mut drain = tm.advance(1010);
-            assert_eq!(drain.next(), Some(1));
-        }
+        assert_eq!(tm.advance(1010).next(), Some(1));
+        assert_eq!(tm.advance(1020).next(), Some(2));
+        assert_eq!(tm.advance(1030).next(), Some(3));
 
-        {
-            let mut drain = tm.advance(1020);
-            assert_eq!(drain.next(), Some(2));
-        }
+        assert_eq!(tm.len(), 0);
 
-        {
-            let mut drain = tm.advance(1030);
-            assert_eq!(drain.next(), Some(3));
-        }
+        /* ------------------------------ Test Many Page & Removal ------------------------------ */
+        const OFST: u64 = 102;
+        tm.reset(OFST);
+        tm.insert(1, OFST + 49133);
+        tm.insert(2, OFST + 310);
+        let h = tm.insert(3, OFST + 59166);
+        tm.insert(4, OFST + 1411);
+
+        assert_eq!(tm.len(), 4);
+        assert_eq!(tm.remove(h), Some(3));
+        assert_eq!(tm.len(), 3);
+
+        assert_eq!(tm.advance(OFST + 310).next(), Some(2));
+        assert_eq!(tm.advance(OFST + 999).next(), None);
+        assert_eq!(tm.advance(OFST + 1411).next(), Some(4));
+        assert_eq!(tm.advance(OFST + 49133).next(), Some(1));
+        assert_eq!(tm.advance(OFST + 60000).next(), None);
+
+        assert_eq!(tm.len(), 0);
+
+        /* ------------------------------------ Test Iterator ----------------------------------- */
+        tm.reset(OFST);
+        tm.insert(1, OFST + 49133);
+        tm.insert(2, OFST + 310);
+        tm.insert(3, OFST + 59166);
+        tm.insert(4, OFST + 1411);
+
+        assert_eq!(tm.len(), 4);
+        assert_eq!(tm.advance(OFST + 60_000).collect::<Vec<_>>(), [2, 4, 1, 3]);
+        assert_eq!(tm.len(), 0);
     }
 }
