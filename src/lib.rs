@@ -214,7 +214,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         let offset = expires_at.saturating_sub(now);
         let msb_idx = 63_u32.saturating_sub(offset.leading_zeros());
         let page = msb_idx as usize / Self::BITS;
-        let cursor = now >> Self::BITS;
+        let cursor = now >> (page * Self::BITS);
         let cursor_offset = offset >> (page * Self::BITS);
         let slot_index = (cursor + cursor_offset) & Self::MASK;
 
@@ -293,12 +293,6 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         self.now = now;
     }
 
-    /// Drain all timers. Prefer [`TimerDriverBase::clear`] if you don't need the drained
-    /// values.
-    pub fn drain(&mut self) -> TimerDriverDrainIter<T, A, PAGES, PAGE_SIZE> {
-        todo!()
-    }
-
     /// Advance timer driver to the given time point.
     ///
     /// # Warning
@@ -323,7 +317,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         let page_hi = 63_usize.saturating_sub(bit_diff.leading_zeros() as _) / Self::BITS;
         let time_diff = now - self.now;
 
-        for page in (0..=page_hi).rev() {
+        for page in 0..=page_hi {
             // There might be an edge case where the amount by which the timer advances is
             // exceptionally large. in such a scenario, we cannot merely compare the
             // cursor position using the masked bit hash, as it could potentially undergo
@@ -335,51 +329,67 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
             let dst_cursor = if time_diff > page_max_time {
                 (cursor + Self::MASK) & Self::MASK
             } else {
-                (now >> (page * Self::BITS)) & Self::MASK
+                ((now >> (page * Self::BITS)) + 1) & Self::MASK
+                //                              ^ For upstream pages, slots including
+                //                              cursor position should be cleared out.
             };
 
             while cursor != dst_cursor {
                 let slot = &mut self.slots[page][cursor as usize];
+                cursor = (cursor + 1) & Self::MASK;
+
+                // Clear out the slot in any case
                 let mut slot_head = replace(&mut slot.head, ELEM_NIL);
                 let slot_tail = replace(&mut slot.tail, ELEM_NIL);
 
                 if page > 0 {
                     // Rehash every item within this slot.
-                    while slot_head != slot_tail {
+                    while slot_head != ELEM_NIL {
                         let node_idx = slot_head;
                         let node = self.slab.get_mut(node_idx).unwrap();
                         slot_head = node.next;
 
-                        let expiration = node.expiration.max(now);
-                        let (new_page, new_slot) = Self::page_and_slot(now, expiration);
+                        if node.expiration <= now {
+                            // Append to expiration tail directly. This does not guarantee
+                            // the timer expiration's incremental order, however, at least
+                            // make it tends to be incremental.
+                            node.prev = expired_tail;
 
-                        let new_slot = &mut self.slots[new_page][new_slot];
-                        node.next = new_slot.head;
-                        Self::assign_node_to_slot_front(&mut self.slab, new_slot, node_idx);
+                            if let Some(tail) = self.slab.get_mut(expired_tail) {
+                                tail.next = node_idx;
+                            } else {
+                                expired_head = node_idx;
+                            }
+
+                            expired_tail = node_idx;
+                        } else {
+                            let expiration = node.expiration.max(now);
+                            let (new_page, new_slot) = Self::page_and_slot(now, expiration);
+
+                            let new_slot = &mut self.slots[new_page][new_slot];
+                            node.next = new_slot.head;
+                            node.prev = ELEM_NIL;
+                            Self::assign_node_to_slot_front(&mut self.slab, new_slot, node_idx);
+                        }
                     }
                 } else {
                     if slot_head == ELEM_NIL {
                         continue;
                     }
 
-                    // append all expired pages to output expiration list
-                    debug_assert!({ self.slab.get(slot_head).unwrap().expiration < now });
+                    // Append expired timers backward
+                    debug_assert!(self.slab.get(slot_head).unwrap().expiration <= now);
+                    self.slab.get_mut(slot_head).unwrap().prev = expired_tail;
 
-                    if let Some(expired) = self.slab.get_mut(expired_head) {
-                        expired.prev = slot_tail;
-
-                        let tail = self.slab.get_mut(slot_tail).unwrap();
-                        tail.next = expired_head;
+                    if let Some(tail) = self.slab.get_mut(expired_tail) {
+                        tail.next = slot_head;
+                    } else {
+                        debug_assert_eq!(expired_tail, ELEM_NIL);
+                        expired_head = slot_head;
                     }
 
-                    if expired_tail == ELEM_NIL {
-                        expired_tail = slot_tail;
-                    }
-
-                    expired_head = slot_head;
+                    expired_tail = slot_tail;
                 }
-
-                cursor = (cursor + 1) & Self::MASK;
             }
         }
 
@@ -539,5 +549,28 @@ mod tests {
     }
 
     #[test]
-    fn test_advance_expiration() {}
+    fn test_advance_expiration() {
+        let mut tm = crate::TimerDriver::<u32, 4, 16>::default();
+
+        /* ----------------------------------- Test First Page ---------------------------------- */
+        tm.reset(1000);
+        tm.insert(1, 1010);
+        tm.insert(2, 1020);
+        tm.insert(3, 1030);
+
+        {
+            let mut drain = tm.advance(1010);
+            assert_eq!(drain.next(), Some(1));
+        }
+
+        {
+            let mut drain = tm.advance(1020);
+            assert_eq!(drain.next(), Some(2));
+        }
+
+        {
+            let mut drain = tm.advance(1030);
+            assert_eq!(drain.next(), Some(3));
+        }
+    }
 }
