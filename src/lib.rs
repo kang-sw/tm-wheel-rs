@@ -45,6 +45,7 @@ pub use _std::*;
 /* -------------------------------------------- Trait ------------------------------------------- */
 
 /// A backend allocator for [`TimerDriverBase`].
+// TODO: document trait APIs for no-std implementors
 pub trait SlabAllocator<T> {
     /// # Panics
     ///
@@ -204,18 +205,16 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
     }
 
     fn page_and_slot(now: TimePoint, expires_at: TimePoint) -> (usize, usize) {
-        // FIXME: From page 1 to above, there's always unused slot present for index 0.
-        // Perhaps we can fix this via extending page coverage, like in 4-bit setup
-        // extending second page to cover 16~272(0~15) range, however, this might add
-        // extra overhead during hashing, which is called inside hot path(rehashing).
-        //
-        // For now, we just let the memory space overhead present, which is usually small
-        // for most of setups. (which significantly is reduced by increasing PAGE_SIZE)
-        let offset = expires_at.saturating_sub(now);
-        let msb_idx = 63_u32.saturating_sub(offset.leading_zeros());
-        let page = msb_idx as usize / Self::BITS;
+        let timeout_after = expires_at.saturating_sub(now);
+        let msb_pos = 63_u32.saturating_sub(timeout_after.leading_zeros());
+
+        // By paging, required number of slots reduces exponentially for larger timeouts.
+        let page = msb_pos as usize / Self::BITS;
+
+        // `cursor` will make the slot index consistent regardless of the slot index which
+        // was derived from `expires_in`
         let cursor = now >> (page * Self::BITS);
-        let cursor_offset = offset >> (page * Self::BITS);
+        let cursor_offset = timeout_after >> (page * Self::BITS);
         let slot_index = (cursor + cursor_offset) & Self::MASK;
 
         (page, slot_index as usize)
@@ -330,10 +329,10 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
                 (cursor + Self::MASK) & Self::MASK
             } else {
                 ((now >> (page * Self::BITS)) + 1) & Self::MASK
-                //                              ^ For upstream pages, slots including
-                //                              cursor position should be cleared out.
+                // We're going to clear out   ^^^ slots inclusively.
             };
 
+            // Validate cursor position.
             while cursor != dst_cursor {
                 let slot = &mut self.slots[page][cursor as usize];
                 cursor = (cursor + 1) & Self::MASK;
@@ -342,6 +341,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
                 let mut slot_head = replace(&mut slot.head, ELEM_NIL);
                 let slot_tail = replace(&mut slot.tail, ELEM_NIL);
 
+                // TODO: extract out `page == 0` branch. Indent too deep!
                 if page > 0 {
                     // Rehash every item within this slot.
                     while slot_head != ELEM_NIL {
@@ -377,7 +377,9 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
                         continue;
                     }
 
-                    // Append expired timers backward
+                    // Append expired timers backward. As the whole slot is just expired,
+                    // this is simple O(1) operation which append linked list chunks to
+                    // end of another list.
                     debug_assert!(self.slab.get(slot_head).unwrap().expiration <= now);
                     self.slab.get_mut(slot_head).unwrap().prev = expired_tail;
 
@@ -406,22 +408,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
 
 /* ----------------------------------------- Handle Type ---------------------------------------- */
 
-/// Handle to a timer.
-///
-/// FIXME: Resolve timer Handle collision. Expired timer handle may affect alive one.
-/// - Inserting generation
-///     - 32 bit: still collision possibility
-///     - 64 bit: memory overhead is significant
-/// - Making timer handle 'owned'
-///     - TimePoint + Handle
-///     - No reuse/collision since handle can't be copied
-///     - No memory overhead
-///     - If TimePoint is same: never collides with existing handle
-///         - XXX: Maybe collide with expired handle??
-///             - FIXME: Expired, but not `remove`d handle -> can invalidate valid timer.
-///     - If TimePoint is different: it's just okay.
-// NOTE: The slab index(`.1`) is nonzero to make niche optimization available, therefore
-// should be decremented by 1 before used as index.
+/// Handle to a created timer.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TimerHandle(TimerGenId, NonZeroU32);
 
