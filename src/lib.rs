@@ -145,7 +145,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
     TimerDriverBase<T, A, PAGES, PAGE_SIZE>
 {
     pub const PAGES: usize = PAGES;
-    const BITS: usize = PAGE_SIZE.next_power_of_two();
+    const BITS: usize = PAGE_SIZE.trailing_zeros() as usize;
     const MASK: u64 = PAGE_SIZE as u64 - 1;
 
     pub fn new(slab: A) -> Self {
@@ -204,6 +204,13 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
     }
 
     fn page_and_slot(now: TimePoint, expires_at: TimePoint) -> (usize, usize) {
+        // FIXME: From page 1 to above, there's always unused slot present for index 0.
+        // Perhaps we can fix this via extending page coverage, like in 4-bit setup
+        // extending second page to cover 16~272(0~15) range, however, this might add
+        // extra overhead during hashing, which is called inside hot path(rehashing).
+        //
+        // For now, we just let the memory space overhead present, which is usually small
+        // for most of setups. (which significantly is reduced by increasing PAGE_SIZE)
         let offset = expires_at.saturating_sub(now);
         let msb_idx = 63_u32.saturating_sub(offset.leading_zeros());
         let page = msb_idx as usize / Self::BITS;
@@ -430,8 +437,64 @@ pub struct TimerDriverDrainIter<
     const PAGE_SIZE: usize,
 > {
     driver: &'a mut TimerDriverBase<T, A, PAGES, PAGE_SIZE>,
-    head: u32,
-    tail: u32,
+    head: ElemIndex,
+    tail: ElemIndex,
+}
+
+impl<'a, T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usize> Iterator
+    for TimerDriverDrainIter<'a, T, A, PAGES, PAGE_SIZE>
+{
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.head == ELEM_NIL {
+            return None;
+        }
+
+        let node_idx = self.head;
+        let node = self.driver.slab.remove(node_idx);
+
+        if self.head == self.tail {
+            // This is required since we don't manipulate linked node's pointer.
+            self.head = ELEM_NIL;
+            self.tail = ELEM_NIL;
+        } else {
+            self.head = node.next;
+        }
+
+        Some(node.value)
+    }
+}
+
+impl<'a, T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usize>
+    DoubleEndedIterator for TimerDriverDrainIter<'a, T, A, PAGES, PAGE_SIZE>
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.tail == ELEM_NIL {
+            return None;
+        }
+
+        let node_idx = self.tail;
+        let node = self.driver.slab.remove(node_idx);
+
+        if self.head == self.tail {
+            // same as above
+            self.head = ELEM_NIL;
+            self.tail = ELEM_NIL;
+        } else {
+            self.tail = node.prev;
+        }
+
+        Some(node.value)
+    }
+}
+
+impl<'a, T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usize> Drop
+    for TimerDriverDrainIter<'a, T, A, PAGES, PAGE_SIZE>
+{
+    fn drop(&mut self) {
+        for _ in self.by_ref() {}
+    }
 }
 
 /* ============================================================================================== */
@@ -464,6 +527,17 @@ mod tests {
         insert_and_compare(40, 1, 2);
         insert_and_compare(50, 1, 3);
         insert_and_compare(60, 1, 3);
+        insert_and_compare(60, 1, 3);
+        insert_and_compare(255, 1, 15);
+
         insert_and_compare(257, 2, 1);
+        insert_and_compare(258, 2, 1);
+        insert_and_compare(512, 2, 2);
+        insert_and_compare(768, 2, 3);
+
+        assert_eq!(tm.len(), 12);
     }
+
+    #[test]
+    fn test_advance_expiration() {}
 }
