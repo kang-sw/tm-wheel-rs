@@ -524,8 +524,6 @@ impl<'a, T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE:
 mod tests {
     use std::collections::HashMap;
 
-    use rand::prelude::{Rng, SeedableRng};
-
     use crate::TimePoint;
 
     #[test]
@@ -613,7 +611,7 @@ mod tests {
     // todo: scaled test from generated inputs
     #[test]
     fn test_many_cases() {
-        let mut rng = rand::prelude::StdRng::seed_from_u64(0);
+        let mut rng = fastrand::Rng::with_seed(0);
         let mut active_handles = HashMap::new();
         let mut timer_id = 0;
         let num_iter = 100000;
@@ -624,17 +622,17 @@ mod tests {
         dbg!(tm.expiration_limit());
 
         for _ in 0..num_iter {
-            now += rng.gen_range(1..128);
+            now += rng.u64(1..128);
 
             for expired in tm.advance(now) {
                 assert!(active_handles.remove(&expired).is_some_and(|v| v <= now));
             }
 
-            for _ in 0..rng.gen_range(0..5) {
+            for _ in 0..rng.usize(0..5) {
                 let id = timer_id;
                 timer_id += 1;
 
-                let expire_at = now + rng.gen_range(1..10000);
+                let expire_at = now + rng.u64(1..10000);
                 active_handles.insert(id, expire_at);
                 tm.insert(id, expire_at);
             }

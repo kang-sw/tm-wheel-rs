@@ -17,4 +17,5 @@ default = ["std"]
 std = ["dep:slab"]
 
 [dev-dependencies]
-rand = "0.8"
+fastrand = "2"
+criterion = "0.5"
