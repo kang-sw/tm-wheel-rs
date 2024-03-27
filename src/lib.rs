@@ -92,9 +92,13 @@ pub trait SlabAllocator<T> {
 /// A type alias for internal time point representation. It can be any unsigned interger
 /// type, where the representation is arbitrary.
 pub type TimePoint = u64;
-type TimerGenId = u64;
 
+/// A type alias to represent delta time between two time points.
+pub type TimeOffset = u64;
+
+type TimerGenId = u64;
 type ElemIndex = u32;
+
 const ELEM_NIL: ElemIndex = u32::MAX;
 
 /// Basic timer driver with manually configurable page size / slab allocator.
@@ -227,9 +231,22 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         (page, slot_index as usize)
     }
 
+    /// Calculate the expiration time point for the given page and slot.
+    fn slot_rehash_timing(now: TimePoint, page: usize, slot_index: usize) -> TimePoint {
+        let cursor = (now >> (page * Self::BITS)) & Self::MASK;
+        let cursor_offset = (slot_index as u64).wrapping_sub(cursor) & Self::MASK;
+
+        now + cursor_offset * Self::time_units(page)
+    }
+
+    /// Unit of time per slot in given page.
+    fn time_units(page: usize) -> TimeOffset {
+        1 << (page * Self::BITS)
+    }
+
     /// Get the maximum amount of time that can be set for a timer. Returned value is
     /// offset time from the current time point.
-    pub fn expiration_limit(&self) -> u64 {
+    pub fn expiration_limit(&self) -> TimeOffset {
         1 << (PAGES * Self::BITS)
     }
 
@@ -299,8 +316,39 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         self.now = now;
     }
 
+    /// Suggested timing for next wakeup. It is guaranteed that none of the timers will be
+    /// overslept until returned time point.
+    ///
+    /// If there's no nearest timer in lowest level page, it'll return the nearest rehash
+    /// timing which will drag down the timers from higher pages, resulting no actual
+    /// timer expiration output.
+    pub fn nearest_wakeup(&mut self) -> TimeOffset {
+        if self.is_empty() {
+            // No timers are registered ... don't even need to wakeup.
+            return TimeOffset::MAX;
+        }
+
+        // Iterate all pages from the lowest slot, until find non-empty one.
+        for page in 0..Self::PAGES {
+            let cursor_base = (self.now >> (page * Self::BITS)) & Self::MASK;
+            let wheel = &self.wheels[page];
+
+            for slot_offset in 0..PAGE_SIZE {
+                let cursor = (cursor_base + slot_offset as u64) & Self::MASK;
+                let slot = &wheel[cursor as usize];
+
+                if slot.head != ELEM_NIL {
+                    return Self::slot_rehash_timing(self.now, page, slot_offset);
+                }
+            }
+        }
+
+        // This is just a logic error
+        unreachable!("no timers are registered, but is_empty() returned false")
+    }
+
     /// Advance timer by timer amount.
-    pub fn advance(&mut self, dt: u64) -> TimerDriverDrainIter<T, A, PAGES, PAGE_SIZE> {
+    pub fn advance(&mut self, dt: TimeOffset) -> TimerDriverDrainIter<T, A, PAGES, PAGE_SIZE> {
         self.advance_to(self.now + dt)
     }
 
