@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Low-level hierachical timing wheel based timer driver implementation"
 license = "MIT"
+repository = "https://github.com/kang-sw/tm-wheel-rs"
 authors = ["kang-sw <ki6080@gmail.com>"]
 categories = ["embedded", "no-std", "timer", "timing-wheel"]
 
