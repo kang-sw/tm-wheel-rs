@@ -314,86 +314,70 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         // From highest changed page ...
         let bit_diff = self.now ^ now;
         let page_hi = 63_usize.saturating_sub(bit_diff.leading_zeros() as _) / Self::BITS;
-        let time_diff = now - self.now;
 
-        for page in 0..=page_hi {
-            // There might be an edge case where the amount by which the timer advances is
-            // exceptionally large. in such a scenario, we cannot merely compare the
-            // cursor position using the masked bit hash, as it could potentially undergo
-            // a complete rotation. for instance, even if the cursor position remains the
-            // same, all timers on the page might have expired.
-            let page_max_time = Self::MASK << (page * Self::BITS);
-            let mut cursor = (self.now >> (page * Self::BITS)) & Self::MASK;
+        Self::visit_slots(self.now, now, [0], |_, cursor| {
+            let slot = &mut self.slots[0][cursor as usize];
 
-            let dst_cursor = if time_diff > page_max_time {
-                (cursor + Self::MASK) & Self::MASK
+            // Clear out the slot in any case
+            let slot_head = replace(&mut slot.head, ELEM_NIL);
+            let slot_tail = replace(&mut slot.tail, ELEM_NIL);
+
+            if slot_head == ELEM_NIL {
+                return;
+            }
+
+            // Append expired timers backward. As the whole slot is just expired,
+            // this is simple O(1) operation which append linked list chunks to
+            // end of another list.
+            debug_assert!(self.slab.get(slot_head).unwrap().expiration <= now);
+            self.slab.get_mut(slot_head).unwrap().prev = expired_tail;
+
+            if let Some(tail) = self.slab.get_mut(expired_tail) {
+                tail.next = slot_head;
             } else {
-                ((now >> (page * Self::BITS)) + 1) & Self::MASK
-                // We're going to clear out   ^^^ slots inclusively.
-            };
+                debug_assert_eq!(expired_tail, ELEM_NIL);
+                expired_head = slot_head;
+            }
 
-            // Validate cursor position.
-            while cursor != dst_cursor {
-                let slot = &mut self.slots[page][cursor as usize];
-                cursor = (cursor + 1) & Self::MASK;
+            expired_tail = slot_tail;
+        });
 
-                // Clear out the slot in any case
-                let mut slot_head = replace(&mut slot.head, ELEM_NIL);
-                let slot_tail = replace(&mut slot.tail, ELEM_NIL);
+        Self::visit_slots(self.now, now, 1..=page_hi, |page, cursor| {
+            let slot = &mut self.slots[page][cursor as usize];
+            let mut slot_head = replace(&mut slot.head, ELEM_NIL);
+            slot.tail = ELEM_NIL;
 
-                // TODO: extract out `page == 0` branch. Indent too deep!
-                if page > 0 {
-                    // Rehash every item within this slot.
-                    while slot_head != ELEM_NIL {
-                        let node_idx = slot_head;
-                        let node = self.slab.get_mut(node_idx).unwrap();
-                        slot_head = node.next;
+            // TODO: extract out `page == 0` branch. Indent too deep!
+            // Rehash every item within this slot.
+            while slot_head != ELEM_NIL {
+                let node_idx = slot_head;
+                let node = self.slab.get_mut(node_idx).unwrap();
+                slot_head = node.next;
 
-                        if node.expiration <= now {
-                            // Append to expiration tail directly. This does not guarantee
-                            // the timer expiration's incremental order, however, at least
-                            // make it tends to be incremental.
-                            node.prev = expired_tail;
-
-                            if let Some(tail) = self.slab.get_mut(expired_tail) {
-                                tail.next = node_idx;
-                            } else {
-                                expired_head = node_idx;
-                            }
-
-                            expired_tail = node_idx;
-                        } else {
-                            let expiration = node.expiration.max(now);
-                            let (new_page, new_slot) = Self::page_and_slot(now, expiration);
-
-                            let new_slot = &mut self.slots[new_page][new_slot];
-                            node.next = new_slot.head;
-                            node.prev = ELEM_NIL;
-                            Self::assign_node_to_slot_front(&mut self.slab, new_slot, node_idx);
-                        }
-                    }
-                } else {
-                    if slot_head == ELEM_NIL {
-                        continue;
-                    }
-
-                    // Append expired timers backward. As the whole slot is just expired,
-                    // this is simple O(1) operation which append linked list chunks to
-                    // end of another list.
-                    debug_assert!(self.slab.get(slot_head).unwrap().expiration <= now);
-                    self.slab.get_mut(slot_head).unwrap().prev = expired_tail;
+                if node.expiration <= now {
+                    // Append to expiration tail directly. This does not guarantee
+                    // the timer expiration's incremental order, however, at least
+                    // make it tends to be incremental.
+                    node.prev = expired_tail;
 
                     if let Some(tail) = self.slab.get_mut(expired_tail) {
-                        tail.next = slot_head;
+                        tail.next = node_idx;
                     } else {
-                        debug_assert_eq!(expired_tail, ELEM_NIL);
-                        expired_head = slot_head;
+                        expired_head = node_idx;
                     }
 
-                    expired_tail = slot_tail;
+                    expired_tail = node_idx;
+                } else {
+                    let expiration = node.expiration.max(now);
+                    let (new_page, new_slot) = Self::page_and_slot(now, expiration);
+
+                    let new_slot = &mut self.slots[new_page][new_slot];
+                    node.next = new_slot.head;
+                    node.prev = ELEM_NIL;
+                    Self::assign_node_to_slot_front(&mut self.slab, new_slot, node_idx);
                 }
             }
-        }
+        });
 
         // update timings
         self.now = now;
@@ -402,6 +386,33 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
             driver: self,
             head: expired_head,
             tail: expired_tail,
+        }
+    }
+
+    fn visit_slots(
+        now: TimePoint,
+        next_now: TimePoint,
+        page_range: impl IntoIterator<Item = usize>,
+        mut visitor: impl FnMut(usize, u64), // (page, cursor)
+    ) {
+        let time_diff = next_now - now;
+
+        for page in page_range {
+            let page_max_time = Self::MASK << (page * Self::BITS);
+            let mut cursor = (now >> (page * Self::BITS)) & Self::MASK;
+
+            let dst_cursor = if time_diff > page_max_time {
+                (cursor + Self::MASK) & Self::MASK
+            } else {
+                ((next_now >> (page * Self::BITS)) + 1) & Self::MASK
+                // We're going to clear out   ^^^ slots inclusively.
+            };
+
+            // Validate cursor position.
+            while cursor != dst_cursor {
+                visitor(page, cursor);
+                cursor = (cursor + 1) & Self::MASK;
+            }
         }
     }
 }
@@ -582,4 +593,6 @@ mod tests {
         assert_eq!(tm.advance(OFST + 60_000).collect::<Vec<_>>(), [2, 4, 1, 3]);
         assert_eq!(tm.len(), 0);
     }
+
+    // TODO: scaled test from generated inputs
 }
