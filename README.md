@@ -4,9 +4,7 @@ This is timer driver implementation. The original idea came from [`tokio`](https
 
 # Usage
 
-```rust
-
-```
+todo
 
 # Features
 

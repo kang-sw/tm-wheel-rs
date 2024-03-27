@@ -100,6 +100,7 @@ const ELEM_NIL: ElemIndex = u32::MAX;
 /// Basic timer driver with manually configurable page size / slab allocator.
 ///
 /// - `PAGES`: Number of timing wheel hierarchy.
+/// - `PAGE_SIZE`: Number of slots in each page. This MUST be power of 2.
 #[derive(Debug, Clone)]
 pub struct TimerDriverBase<
     T,
