@@ -103,19 +103,19 @@ const ELEM_NIL: ElemIndex = u32::MAX;
 
 /// Basic timer driver with manually configurable page size / slab allocator.
 ///
-/// - `PAGES`: Number of timing wheel hierarchy.
-/// - `PAGE_SIZE`: Number of slots in each page. This MUST be power of 2.
+/// - `WHEELS`: Number of timing wheel hierarchy.
+/// - `WHEEL_LENGTH`: Number of slots in each page. This MUST be power of 2.
 #[derive(Debug, Clone)]
 pub struct TimerDriverBase<
     T,
     A: SlabAllocator<TimerNode<T>>,
-    const PAGES: usize,
-    const PAGE_SIZE: usize,
+    const LEVELS: usize,
+    const WHEEL_SIZE: usize,
 > {
     slab: A,
     id_alloc: u64,
     now: crate::TimePoint,
-    wheels: [[TimerPageSlot; PAGE_SIZE]; PAGES],
+    wheels: [[TimerWheelBucket; WHEEL_SIZE]; LEVELS],
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -129,12 +129,12 @@ pub struct TimerNode<T> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct TimerPageSlot {
+struct TimerWheelBucket {
     head: ElemIndex,
     tail: ElemIndex,
 }
 
-impl Default for TimerPageSlot {
+impl Default for TimerWheelBucket {
     fn default() -> Self {
         Self {
             head: ELEM_NIL,
@@ -143,8 +143,8 @@ impl Default for TimerPageSlot {
     }
 }
 
-impl<T, A, const PAGES: usize, const PAGE_SIZE: usize> Default
-    for TimerDriverBase<T, A, PAGES, PAGE_SIZE>
+impl<T, A, const LEVELS: usize, const WHEEL_SIZE: usize> Default
+    for TimerDriverBase<T, A, LEVELS, WHEEL_SIZE>
 where
     A: SlabAllocator<TimerNode<T>> + Default,
 {
@@ -153,21 +153,21 @@ where
     }
 }
 
-impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usize>
-    TimerDriverBase<T, A, PAGES, PAGE_SIZE>
+impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: usize>
+    TimerDriverBase<T, A, LEVELS, WHEEL_SIZE>
 {
-    pub const PAGES: usize = PAGES;
-    const BITS: usize = PAGE_SIZE.trailing_zeros() as usize;
-    const MASK: u64 = PAGE_SIZE as u64 - 1;
+    pub const LEVELS: usize = LEVELS;
+    const BITS: usize = WHEEL_SIZE.trailing_zeros() as usize;
+    const MASK: u64 = WHEEL_SIZE as u64 - 1;
 
     pub fn new(slab: A) -> Self {
-        debug_assert!(PAGE_SIZE.is_power_of_two());
+        debug_assert!(WHEEL_SIZE.is_power_of_two());
 
         Self {
             slab,
             id_alloc: 0,
             now: 0,
-            wheels: [[Default::default(); PAGE_SIZE]; PAGES],
+            wheels: [[Default::default(); WHEEL_SIZE]; LEVELS],
             _phantom: Default::default(),
         }
     }
@@ -179,7 +179,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
     /// - Specified timer expiration is out of range.
     /// - Active timer instance is larger than 2^32-1
     pub fn insert(&mut self, value: T, expires_at: TimePoint) -> TimerHandle {
-        let (page, slot_index) = Self::page_and_slot(self.now, expires_at);
+        let (page, slot_index) = Self::wheel_and_bucket(self.now, expires_at);
         let slot = &mut self.wheels[page][slot_index];
 
         let node = TimerNode {
@@ -197,11 +197,11 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         let id = node.id.get();
         let new_node = self.slab.insert(node);
 
-        Self::assign_node_to_slot_front(&mut self.slab, slot, new_node);
+        Self::assign_node_to_bucket_front(&mut self.slab, slot, new_node);
         TimerHandle(id, NonZeroU32::new(new_node + 1).unwrap())
     }
 
-    fn assign_node_to_slot_front(slab: &mut A, slot: &mut TimerPageSlot, node_idx: ElemIndex) {
+    fn assign_node_to_bucket_front(slab: &mut A, slot: &mut TimerWheelBucket, node_idx: ElemIndex) {
         debug_assert!(slab.get(node_idx).unwrap().next == slot.head);
 
         if slot.head == ELEM_NIL {
@@ -215,39 +215,35 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         slot.head = node_idx;
     }
 
-    fn page_and_slot(now: TimePoint, expires_at: TimePoint) -> (usize, usize) {
-        let timeout_after = expires_at.saturating_sub(now);
-        let msb_pos = 63_u32.saturating_sub(timeout_after.leading_zeros());
+    fn wheel_and_bucket(now: TimePoint, expires_at: TimePoint) -> (usize, usize) {
+        // TODO: Re-architect this.
+        // - Once registered, offset time range which cannot be fit to single BIT_MASK
+        //   range should be tossed to upstream page.
+        // - Let's assume the PAGE_BITS is 4. then the timer item `A` with expiration
+        //   1_0000 will be registered to next page.
+        // - The original logic tries to detect bit flip of current level. In this case,
+        //   the current time 0000~1111 won't touch the second page, where the item `A`
+        //   already has the timeout which is less than 1_0000.
+        // - Therefore, every `ONE` of each page should be treated specially, since they
+        //   easily be invalidated as the timestamp advances.
+        // - Should we re-hash every first bucket of each page on every time step advance?
+        //   it's not realistic and very inefficient.
+        // - The point is, making each page *intersect* and letting the lowest bucket to
+        //   be distributed into lower buckets, and storing items with bucket offset
+        //   larger than 1 to be held on current page.
 
-        // By paging, required number of slots reduces exponentially for larger timeouts.
-        let page = msb_pos as usize / Self::BITS;
-
-        // `cursor` will make the slot index consistent regardless of the slot index which
-        // was derived from `expires_in`
-        let cursor = now >> (page * Self::BITS);
-        let cursor_offset = timeout_after >> (page * Self::BITS);
-        let slot_index = (cursor + cursor_offset) & Self::MASK;
-
-        (page, slot_index as usize)
-    }
-
-    /// Calculate the expiration time point for the given page and slot.
-    fn slot_rehash_timing(now: TimePoint, page: usize, slot_index: usize) -> TimePoint {
-        let cursor = (now >> (page * Self::BITS)) & Self::MASK;
-        let cursor_offset = (slot_index as u64).wrapping_sub(cursor) & Self::MASK;
-
-        now + cursor_offset * Self::time_units(page)
+        todo!()
     }
 
     /// Unit of time per slot in given page.
-    fn time_units(page: usize) -> TimeOffset {
-        1 << (page * Self::BITS)
+    fn time_units(wheel: usize) -> TimeOffset {
+        1 << (wheel * Self::BITS)
     }
 
     /// Get the maximum amount of time that can be set for a timer. Returned value is
     /// offset time from the current time point.
     pub fn expiration_limit(&self) -> TimeOffset {
-        1 << (PAGES * Self::BITS)
+        1 << (LEVELS * Self::BITS)
     }
 
     /// Remove given timer handle from the driver.
@@ -259,15 +255,15 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         }
 
         let node_expire_at = node.expiration;
-        let (page, slot_index) = Self::page_and_slot(self.now, node_expire_at);
+        let (wheel, bucket_idx) = Self::wheel_and_bucket(self.now, node_expire_at);
 
-        let slot = &mut self.wheels[page][slot_index];
+        let slot = &mut self.wheels[wheel][bucket_idx];
         Self::unlink(&mut self.slab, slot, handle.index());
 
         Some(self.slab.remove(handle.index()).value)
     }
 
-    fn unlink(slab: &mut A, slot: &mut TimerPageSlot, node_idx: ElemIndex) {
+    fn unlink(slab: &mut A, bucket: &mut TimerWheelBucket, node_idx: ElemIndex) {
         let node = slab.get(node_idx).unwrap();
         let prev = node.prev;
         let next = node.next;
@@ -276,16 +272,16 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
             let prev_node = slab.get_mut(prev).unwrap();
             prev_node.next = next;
         } else {
-            debug_assert_eq!(slot.head, node_idx);
-            slot.head = next;
+            debug_assert_eq!(bucket.head, node_idx);
+            bucket.head = next;
         }
 
         if next != ELEM_NIL {
             let next_node = slab.get_mut(next).unwrap();
             next_node.prev = prev;
         } else {
-            debug_assert_eq!(slot.tail, node_idx);
-            slot.tail = prev;
+            debug_assert_eq!(bucket.tail, node_idx);
+            bucket.tail = prev;
         }
     }
 
@@ -329,16 +325,16 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         }
 
         // Iterate all pages from the lowest slot, until find non-empty one.
-        for page in 0..Self::PAGES {
-            let cursor_base = (self.now >> (page * Self::BITS)) & Self::MASK;
-            let wheel = &self.wheels[page];
+        for wheel_idx in 0..Self::LEVELS {
+            let cursor_base = (self.now >> (wheel_idx * Self::BITS)) & Self::MASK;
+            let wheel = &self.wheels[wheel_idx];
 
-            for slot_offset in 0..PAGE_SIZE {
-                let cursor = (cursor_base + slot_offset as u64) & Self::MASK;
-                let slot = &wheel[cursor as usize];
+            for bucket_offset in 0..WHEEL_SIZE {
+                let cursor = (cursor_base + bucket_offset as u64) & Self::MASK;
+                let bucket = &wheel[cursor as usize];
 
-                if slot.head != ELEM_NIL {
-                    return Self::slot_rehash_timing(self.now, page, slot_offset);
+                if bucket.head != ELEM_NIL {
+                    return self.now + Self::time_units(wheel_idx);
                 }
             }
         }
@@ -348,7 +344,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
     }
 
     /// Advance timer by timer amount.
-    pub fn advance(&mut self, dt: TimeOffset) -> TimerDriverDrainIter<T, A, PAGES, PAGE_SIZE> {
+    pub fn advance(&mut self, dt: TimeOffset) -> TimerDriverDrainIter<T, A, LEVELS, WHEEL_SIZE> {
         self.advance_to(self.now + dt)
     }
 
@@ -364,7 +360,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
     /// Panics if the given time point is less than the current time point. Same time
     /// point doesn't cause panic, as it's meaningful for timer insertions that are
     /// *already expired*.
-    pub fn advance_to(&mut self, now: TimePoint) -> TimerDriverDrainIter<T, A, PAGES, PAGE_SIZE> {
+    pub fn advance_to(&mut self, now: TimePoint) -> TimerDriverDrainIter<T, A, LEVELS, WHEEL_SIZE> {
         assert!(now >= self.now, "time advanced backward!");
 
         // Detect all cursor advances
@@ -374,45 +370,45 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         // From highest changed page ...
         let bit_diff = self.now ^ now;
         let mut page_hi = 63_usize.saturating_sub(bit_diff.leading_zeros() as _) / Self::BITS;
-        page_hi = page_hi.min(PAGES - 1);
+        page_hi = page_hi.min(LEVELS - 1);
 
-        Self::visit_slots(self.now, now, [0], |_, cursor| {
-            let slot = &mut self.wheels[0][cursor as usize];
+        Self::visit_buckets(self.now, now, [0], |_, cursor| {
+            let bucket = &mut self.wheels[0][cursor as usize];
 
             // Clear out the slot in any case
-            let slot_head = replace(&mut slot.head, ELEM_NIL);
-            let slot_tail = replace(&mut slot.tail, ELEM_NIL);
+            let bucket_head = replace(&mut bucket.head, ELEM_NIL);
+            let bucket_tail = replace(&mut bucket.tail, ELEM_NIL);
 
-            if slot_head == ELEM_NIL {
+            if bucket_head == ELEM_NIL {
                 return;
             }
 
             // Append expired timers backward. As the whole slot is just expired,
             // this is simple O(1) operation which append linked list chunks to
             // end of another list.
-            debug_assert!(self.slab.get(slot_head).unwrap().expiration <= now);
-            self.slab.get_mut(slot_head).unwrap().prev = expired_tail;
+            debug_assert!(self.slab.get(bucket_head).unwrap().expiration <= now);
+            self.slab.get_mut(bucket_head).unwrap().prev = expired_tail;
 
             if let Some(tail) = self.slab.get_mut(expired_tail) {
-                tail.next = slot_head;
+                tail.next = bucket_head;
             } else {
                 debug_assert_eq!(expired_tail, ELEM_NIL);
-                expired_head = slot_head;
+                expired_head = bucket_head;
             }
 
-            expired_tail = slot_tail;
+            expired_tail = bucket_tail;
         });
 
-        Self::visit_slots(self.now, now, 1..=page_hi, |page, cursor| {
-            let slot = &mut self.wheels[page][cursor as usize];
-            let mut slot_head = replace(&mut slot.head, ELEM_NIL);
-            slot.tail = ELEM_NIL;
+        Self::visit_buckets(self.now, now, 1..=page_hi, |page, cursor| {
+            let bucket = &mut self.wheels[page][cursor as usize];
+            let mut bucket_head = replace(&mut bucket.head, ELEM_NIL);
+            bucket.tail = ELEM_NIL;
 
             // Rehash every item within this slot.
-            while slot_head != ELEM_NIL {
-                let node_idx = slot_head;
+            while bucket_head != ELEM_NIL {
+                let node_idx = bucket_head;
                 let node = self.slab.get_mut(node_idx).unwrap();
-                slot_head = node.next;
+                bucket_head = node.next;
 
                 if node.expiration <= now {
                     // XXX: Batch expiration can be handled efficiently
@@ -436,12 +432,12 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
                     expired_tail = node_idx;
                 } else {
                     let expiration = node.expiration.max(now);
-                    let (new_page, new_slot) = Self::page_and_slot(now, expiration);
+                    let (new_wheel, new_bucket) = Self::wheel_and_bucket(now, expiration);
 
-                    let new_slot = &mut self.wheels[new_page][new_slot];
-                    node.next = new_slot.head;
+                    let new_bucket = &mut self.wheels[new_wheel][new_bucket];
+                    node.next = new_bucket.head;
                     node.prev = ELEM_NIL;
-                    Self::assign_node_to_slot_front(&mut self.slab, new_slot, node_idx);
+                    Self::assign_node_to_bucket_front(&mut self.slab, new_bucket, node_idx);
                 }
             }
         });
@@ -456,7 +452,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         }
     }
 
-    fn visit_slots(
+    fn visit_buckets(
         now: TimePoint,
         next_now: TimePoint,
         page_range: impl IntoIterator<Item = usize>,
@@ -630,8 +626,11 @@ mod tests {
         tm.insert(2, 1020);
         tm.insert(3, 1030);
 
+        assert_eq!(tm.nearest_wakeup(), 1010);
         assert_eq!(tm.advance_to(1010).next(), Some(1));
+        assert_eq!(tm.nearest_wakeup(), 1020);
         assert_eq!(tm.advance_to(1020).next(), Some(2));
+        assert_eq!(tm.nearest_wakeup(), 1030);
         assert_eq!(tm.advance_to(1030).next(), Some(3));
 
         assert_eq!(tm.len(), 0);
@@ -648,10 +647,15 @@ mod tests {
         assert_eq!(tm.remove(h), Some(3));
         assert_eq!(tm.len(), 3);
 
+        dbg!(tm.nearest_wakeup());
         assert_eq!(tm.advance_to(OFST + 310).next(), Some(2));
+        dbg!(tm.nearest_wakeup());
         assert_eq!(tm.advance_to(OFST + 999).next(), None);
+        dbg!(tm.nearest_wakeup());
         assert_eq!(tm.advance_to(OFST + 1411).next(), Some(4));
+        dbg!(tm.nearest_wakeup());
         assert_eq!(tm.advance_to(OFST + 49133).next(), Some(1));
+        dbg!(tm.nearest_wakeup());
         assert_eq!(tm.advance_to(OFST + 60000).next(), None);
 
         assert_eq!(tm.len(), 0);
