@@ -1,6 +1,7 @@
 #![doc=include_str!("../README.md")]
 
 use core::{
+    f32::consts::E,
     mem::replace,
     num::{NonZeroU32, NonZeroU64},
 };
@@ -85,12 +86,27 @@ pub trait SlabAllocator<T> {
     }
 }
 
+trait SlabExt<T>
+where
+    Self: SlabAllocator<T>,
+{
+    fn at(&self, key: u32) -> &T {
+        self.get(key).unwrap()
+    }
+
+    fn at_mut(&mut self, key: u32) -> &mut T {
+        self.get_mut(key).unwrap()
+    }
+}
+
+impl<T, A> SlabExt<T> for A where A: SlabAllocator<T> {}
+
 /* ============================================================================================== */
 /*                                           TIMER BASE                                           */
 /* ============================================================================================== */
 
-/// A type alias for internal time point representation. It can be any unsigned interger
-/// type, where the representation is arbitrary.
+/// A type alias for internal time point representation. It can be any unsigned interger type,
+/// where the representation is arbitrary.
 pub type TimePoint = u64;
 
 /// A type alias to represent delta time between two time points.
@@ -115,10 +131,11 @@ pub struct TimerDriverBase<
     slab: A,
     id_alloc: u64,
     now: crate::TimePoint,
-    wheels: [[TimerWheelBucket; WHEEL_SIZE]; LEVELS],
+    wheels: [TimerWheel<WHEEL_SIZE>; LEVELS],
     _phantom: std::marker::PhantomData<T>,
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct TimerNode<T> {
     value: T,
@@ -160,6 +177,9 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
     const BITS: usize = WHEEL_SIZE.trailing_zeros() as usize;
     const MASK: u64 = WHEEL_SIZE as u64 - 1;
 
+    const E_BITS: usize = Self::BITS << 1;
+    const E_MASK: u64 = (WHEEL_SIZE << 1) as u64 - 1;
+
     pub fn new(slab: A) -> Self {
         debug_assert!(WHEEL_SIZE.is_power_of_two());
 
@@ -167,7 +187,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
             slab,
             id_alloc: 0,
             now: 0,
-            wheels: [[Default::default(); WHEEL_SIZE]; LEVELS],
+            wheels: [Default::default(); LEVELS],
             _phantom: Default::default(),
         }
     }
@@ -179,7 +199,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
     /// - Specified timer expiration is out of range.
     /// - Active timer instance is larger than 2^32-1
     pub fn insert(&mut self, value: T, expires_at: TimePoint) -> TimerHandle {
-        let (page, slot_index) = Self::wheel_and_bucket(self.now, expires_at);
+        let (page, slot_index) = Self::level_and_bucket(self.now, expires_at);
         let slot = &mut self.wheels[page][slot_index];
 
         let node = TimerNode {
@@ -202,42 +222,55 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
     }
 
     fn assign_node_to_bucket_front(slab: &mut A, slot: &mut TimerWheelBucket, node_idx: ElemIndex) {
-        debug_assert!(slab.get(node_idx).unwrap().next == slot.head);
+        debug_assert!(slab.at(node_idx).next == slot.head);
 
         if slot.head == ELEM_NIL {
             slot.tail = node_idx;
         } else {
             let head = slot.head;
-            let head_node = slab.get_mut(head).unwrap();
+            let head_node = slab.at_mut(head);
             head_node.prev = node_idx;
         }
 
         slot.head = node_idx;
     }
 
-    fn wheel_and_bucket(now: TimePoint, expires_at: TimePoint) -> (usize, usize) {
+    fn level_and_bucket(now: TimePoint, expires_at: TimePoint) -> (usize, usize) {
         // TODO: Re-architect this.
-        // - Once registered, offset time range which cannot be fit to single BIT_MASK
-        //   range should be tossed to upstream page.
-        // - Let's assume the PAGE_BITS is 4. then the timer item `A` with expiration
-        //   1_0000 will be registered to next page.
-        // - The original logic tries to detect bit flip of current level. In this case,
-        //   the current time 0000~1111 won't touch the second page, where the item `A`
-        //   already has the timeout which is less than 1_0000.
-        // - Therefore, every `ONE` of each page should be treated specially, since they
-        //   easily be invalidated as the timestamp advances.
-        // - Should we re-hash every first bucket of each page on every time step advance?
-        //   it's not realistic and very inefficient.
-        // - The point is, making each page *intersect* and letting the lowest bucket to
-        //   be distributed into lower buckets, and storing items with bucket offset
-        //   larger than 1 to be held on current page.
+        // - Once registered, offset time range which cannot be fit to single BIT_MASK range should
+        //   be tossed to upstream level.
+        // - Let's assume the PAGE_BITS is 4. then the timer item `A` with expiration 1_0000 will
+        //   be registered to next level.
+        // - The original logic tries to detect bit flip of current level. In this case, the
+        //   current time 0000~1111 won't touch the second level, where the item `A` already has
+        //   the timeout which is less than 1_0000.
+        // - Therefore, every `ONE` of each level should be treated specially, since they easily be
+        //   invalidated as the timestamp advances.
+        // - Should we re-hash every first bucket of each level on every time step advance? it's
+        //   not realistic and very inefficient.
+        // - The point is, making each level *intersect* and letting the lowest bucket to be
+        //   distributed into lower buckets, and storing items with bucket offset larger than 1 to
+        //   be held on current level.
 
-        todo!()
+        let timeout = expires_at - now;
+        let msb_pos = (63u32 - 1).saturating_sub(timeout.leading_zeros());
+        //                        ^^^ To downgrade the last bucket of upper level ...
+        // e.g. for 4bit bucket, 1_xxxx will be treated level 0. 1x_xxxx is level 1.
+        // -                     ^ msb_pos=4-1=3:=lv.0           ^ msb_pos=5-1=4:=lv.1
+
+        let level = msb_pos as usize / Self::BITS;
+        let cursor = now >> (level * Self::BITS);
+        let cursor_offset = timeout >> (level * Self::BITS);
+
+        // We use extended mask here, to intrude upper level's LSB component.
+        let bucket = (cursor + cursor_offset) & Self::E_MASK;
+
+        (level, bucket as usize)
     }
 
     /// Unit of time per slot in given page.
-    fn time_units(wheel: usize) -> TimeOffset {
-        1 << (wheel * Self::BITS)
+    fn time_units(level: usize) -> TimeOffset {
+        1 << (level * Self::BITS)
     }
 
     /// Get the maximum amount of time that can be set for a timer. Returned value is
@@ -255,21 +288,21 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
         }
 
         let node_expire_at = node.expiration;
-        let (wheel, bucket_idx) = Self::wheel_and_bucket(self.now, node_expire_at);
+        let (level, bucket_idx) = Self::level_and_bucket(self.now, node_expire_at);
 
-        let slot = &mut self.wheels[wheel][bucket_idx];
+        let slot = &mut self.wheels[level][bucket_idx];
         Self::unlink(&mut self.slab, slot, handle.index());
 
         Some(self.slab.remove(handle.index()).value)
     }
 
     fn unlink(slab: &mut A, bucket: &mut TimerWheelBucket, node_idx: ElemIndex) {
-        let node = slab.get(node_idx).unwrap();
+        let node = slab.at(node_idx);
         let prev = node.prev;
         let next = node.next;
 
         if prev != ELEM_NIL {
-            let prev_node = slab.get_mut(prev).unwrap();
+            let prev_node = slab.at_mut(prev);
             prev_node.next = next;
         } else {
             debug_assert_eq!(bucket.head, node_idx);
@@ -277,7 +310,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
         }
 
         if next != ELEM_NIL {
-            let next_node = slab.get_mut(next).unwrap();
+            let next_node = slab.at_mut(next);
             next_node.prev = prev;
         } else {
             debug_assert_eq!(bucket.tail, node_idx);
@@ -329,7 +362,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
             let cursor_base = (self.now >> (wheel_idx * Self::BITS)) & Self::MASK;
             let wheel = &self.wheels[wheel_idx];
 
-            for bucket_offset in 0..WHEEL_SIZE {
+            for bucket_offset in 0..2 * WHEEL_SIZE {
                 let cursor = (cursor_base + bucket_offset as u64) & Self::MASK;
                 let bucket = &wheel[cursor as usize];
 
@@ -341,11 +374,6 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
 
         // This is just a logic error
         unreachable!("no timers are registered, but is_empty() returned false")
-    }
-
-    /// Advance timer by timer amount.
-    pub fn advance(&mut self, dt: TimeOffset) -> TimerDriverDrainIter<T, A, LEVELS, WHEEL_SIZE> {
-        self.advance_to(self.now + dt)
     }
 
     /// Advance timer driver to the given time point.
@@ -360,90 +388,71 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
     /// Panics if the given time point is less than the current time point. Same time
     /// point doesn't cause panic, as it's meaningful for timer insertions that are
     /// *already expired*.
-    pub fn advance_to(&mut self, now: TimePoint) -> TimerDriverDrainIter<T, A, LEVELS, WHEEL_SIZE> {
-        assert!(now >= self.now, "time advanced backward!");
+    pub fn advance_to(
+        &mut self,
+        time_point: TimePoint,
+    ) -> TimerDriverDrainIter<T, A, LEVELS, WHEEL_SIZE> {
+        self.advance(time_point - self.now)
+    }
 
+    /// Advance timer by timer amount.
+    pub fn advance(
+        &mut self,
+        advance: TimeOffset,
+    ) -> TimerDriverDrainIter<T, A, LEVELS, WHEEL_SIZE> {
         // Detect all cursor advances
         let mut expired_head = ELEM_NIL;
         let mut expired_tail = ELEM_NIL;
 
+        // Firstly expire all lowest levels
+        let next_tp = self.now + advance;
+        let advance_amount = advance - self.now;
+
+        {
+            let mut cursor = self.now & Self::E_MASK;
+            let dst_cursor = if advance_amount > Self::E_MASK {
+                Self::E_MASK
+            } else {
+                next_tp & Self::E_MASK
+            };
+
+            let wheel = &mut self.wheels[0];
+            loop {
+                // Always clear out current cursor position
+                let bucket = &mut wheel[cursor as usize];
+                let head = replace(&mut bucket.head, ELEM_NIL);
+                let tail = replace(&mut bucket.tail, ELEM_NIL);
+
+                // For lowest page, append is always O(1) for any number of nodes
+                if expired_head == ELEM_NIL {
+                    expired_head = head;
+                    expired_tail = tail;
+                } else {
+                    self.slab.at_mut(expired_tail).next = head;
+                    self.slab.at_mut(head).prev = expired_tail;
+
+                    expired_tail = tail
+                }
+
+                if cursor == dst_cursor {
+                    break;
+                }
+
+                cursor = (cursor + 1) & Self::E_MASK
+            }
+        }
+
         // From highest changed page ...
-        let bit_diff = self.now ^ now;
+        let bit_diff = self.now ^ advance;
         let mut page_hi = 63_usize.saturating_sub(bit_diff.leading_zeros() as _) / Self::BITS;
         page_hi = page_hi.min(LEVELS - 1);
 
-        Self::visit_buckets(self.now, now, [0], |_, cursor| {
-            let bucket = &mut self.wheels[0][cursor as usize];
-
-            // Clear out the slot in any case
-            let bucket_head = replace(&mut bucket.head, ELEM_NIL);
-            let bucket_tail = replace(&mut bucket.tail, ELEM_NIL);
-
-            if bucket_head == ELEM_NIL {
-                return;
-            }
-
-            // Append expired timers backward. As the whole slot is just expired,
-            // this is simple O(1) operation which append linked list chunks to
-            // end of another list.
-            debug_assert!(self.slab.get(bucket_head).unwrap().expiration <= now);
-            self.slab.get_mut(bucket_head).unwrap().prev = expired_tail;
-
-            if let Some(tail) = self.slab.get_mut(expired_tail) {
-                tail.next = bucket_head;
-            } else {
-                debug_assert_eq!(expired_tail, ELEM_NIL);
-                expired_head = bucket_head;
-            }
-
-            expired_tail = bucket_tail;
-        });
-
-        Self::visit_buckets(self.now, now, 1..=page_hi, |page, cursor| {
-            let bucket = &mut self.wheels[page][cursor as usize];
-            let mut bucket_head = replace(&mut bucket.head, ELEM_NIL);
-            bucket.tail = ELEM_NIL;
-
-            // Rehash every item within this slot.
-            while bucket_head != ELEM_NIL {
-                let node_idx = bucket_head;
-                let node = self.slab.get_mut(node_idx).unwrap();
-                bucket_head = node.next;
-
-                if node.expiration <= now {
-                    // XXX: Batch expiration can be handled efficiently
-                    // - `node.expiration` check becomes redundant if this `now` exceeds
-                    //   this page's maximum time range.
-                    // - To check this, create new method `Self::slot_max_time(self.now,
-                    //   page, slot)` which returns the maximum time point that this slot
-                    //   can hold.
-
-                    // Append to expiration tail directly. This does not guarantee
-                    // the timer expiration's incremental order, however, at least
-                    // make it tends to be incremental.
-                    node.prev = expired_tail;
-
-                    if let Some(tail) = self.slab.get_mut(expired_tail) {
-                        tail.next = node_idx;
-                    } else {
-                        expired_head = node_idx;
-                    }
-
-                    expired_tail = node_idx;
-                } else {
-                    let expiration = node.expiration.max(now);
-                    let (new_wheel, new_bucket) = Self::wheel_and_bucket(now, expiration);
-
-                    let new_bucket = &mut self.wheels[new_wheel][new_bucket];
-                    node.next = new_bucket.head;
-                    node.prev = ELEM_NIL;
-                    Self::assign_node_to_bucket_front(&mut self.slab, new_bucket, node_idx);
-                }
-            }
-        });
+        {
+            // TODO: Reimplement re-hashing logic
+        }
 
         // update timings
-        self.now = now;
+        self.now = advance;
 
         TimerDriverDrainIter {
             driver: self,
@@ -451,37 +460,38 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
             tail: expired_tail,
         }
     }
+}
 
-    fn visit_buckets(
-        now: TimePoint,
-        next_now: TimePoint,
-        page_range: impl IntoIterator<Item = usize>,
-        mut visitor: impl FnMut(usize, u64), // (page, cursor)
-    ) {
-        let time_diff = next_now - now;
+/* -------------------------------------- Timer Bucket Type ------------------------------------- */
 
-        for page in page_range {
-            let page_max_time = Self::MASK << (page * Self::BITS);
-            let cursor = (now >> (page * Self::BITS)) & Self::MASK;
+#[derive(Debug, Clone, Copy)]
+struct TimerWheel<const WHEEL_SIZE: usize> {
+    buckets: [[TimerWheelBucket; WHEEL_SIZE]; 2],
+}
 
-            let iter_count = if time_diff > page_max_time {
-                // The time difference exceeds the page's maximum time range. Therefore,
-                // every timer item in this page will be expired.
-                1 << Self::BITS
-            } else {
-                let dst = (next_now >> (page * Self::BITS)) & Self::MASK;
-                1 + if dst < cursor {
-                    (1 << Self::BITS) - cursor + dst
-                } else {
-                    dst - cursor
-                }
-            };
+impl<const WHEEL_SIZE: usize> TimerWheel<WHEEL_SIZE> {
+    const MASK: u64 = WHEEL_SIZE as u64 - 1;
+}
 
-            // Validate cursor position.
-            for iter in 0..iter_count {
-                visitor(page, (cursor + iter) & Self::MASK);
-            }
+impl<const WHEEL_SIZE: usize> Default for TimerWheel<WHEEL_SIZE> {
+    fn default() -> Self {
+        Self {
+            buckets: [[Default::default(); WHEEL_SIZE]; 2],
         }
+    }
+}
+
+impl<const WHEEL_SIZE: usize> std::ops::Index<usize> for TimerWheel<WHEEL_SIZE> {
+    type Output = TimerWheelBucket;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.buckets[(index > WHEEL_SIZE) as usize][index & Self::MASK as usize]
+    }
+}
+
+impl<const WHEEL_SIZE: usize> std::ops::IndexMut<usize> for TimerWheel<WHEEL_SIZE> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.buckets[(index > WHEEL_SIZE) as usize][index & Self::MASK as usize]
     }
 }
 
