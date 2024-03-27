@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
 use fastrand::Rng;
-use timey::TimerDriver;
+use tm_wheel::TimerDriver;
 
 /* ---------------------------------------- Insert Remove --------------------------------------- */
 
@@ -10,7 +10,7 @@ fn insert_remove<const PAGE: usize, const PAGE_SIZE: usize>(c: &mut Bencher) {
     // Let timer items distribute evenly
     c.iter_custom(|iters| {
         let mut rng = Rng::with_seed(0);
-        let mut tm = timey::TimerDriver::<u32, PAGE, PAGE_SIZE>::default();
+        let mut tm = TimerDriver::<u32, PAGE, PAGE_SIZE>::default();
         let mut handles = Vec::with_capacity(iters as _);
         tm.reserve(iters as _);
 

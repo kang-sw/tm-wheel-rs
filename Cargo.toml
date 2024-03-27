@@ -1,11 +1,11 @@
 [package]
-name = "timey"
+name = "tm-wheel"
 version = "0.1.0"
 edition = "2021"
 description = "Low-level hierachical timing wheel based timer driver implementation"
 license = "MIT"
 authors = ["kang-sw <ki6080@gmail.com>"]
-categories = ["embedded", "no-std", "timer"]
+categories = ["embedded", "no-std", "timer", "timing-wheel"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
