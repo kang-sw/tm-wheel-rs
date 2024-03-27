@@ -19,3 +19,8 @@ std = ["dep:slab"]
 [dev-dependencies]
 fastrand = "2"
 criterion = "0.5"
+
+[[bench]]
+name = "many"
+harness = false
+required-features = ["std"]

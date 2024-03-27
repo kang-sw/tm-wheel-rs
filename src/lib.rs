@@ -1,3 +1,5 @@
+#![doc=include_str!("../README.md")]
+
 use core::{
     mem::replace,
     num::{NonZeroU32, NonZeroU64},
@@ -96,6 +98,9 @@ type ElemIndex = u32;
 const ELEM_NIL: ElemIndex = u32::MAX;
 
 /// Basic timer driver with manually configurable page size / slab allocator.
+///
+/// - `PAGES`: Number of timing wheel hierarchy.
+#[derive(Debug, Clone)]
 pub struct TimerDriverBase<
     T,
     A: SlabAllocator<TimerNode<T>>,
@@ -105,10 +110,11 @@ pub struct TimerDriverBase<
     slab: A,
     id_alloc: u64,
     now: crate::TimePoint,
-    slots: [[TimerPageSlot; PAGE_SIZE]; PAGES],
+    wheels: [[TimerPageSlot; PAGE_SIZE]; PAGES],
     _phantom: std::marker::PhantomData<T>,
 }
 
+#[derive(Debug, Clone)]
 pub struct TimerNode<T> {
     value: T,
     id: NonZeroU64,
@@ -156,7 +162,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
             slab,
             id_alloc: 0,
             now: 0,
-            slots: [[Default::default(); PAGE_SIZE]; PAGES],
+            wheels: [[Default::default(); PAGE_SIZE]; PAGES],
             _phantom: Default::default(),
         }
     }
@@ -169,7 +175,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
     /// - Active timer instance is larger than 2^32-1
     pub fn insert(&mut self, value: T, expires_at: TimePoint) -> TimerHandle {
         let (page, slot_index) = Self::page_and_slot(self.now, expires_at);
-        let slot = &mut self.slots[page][slot_index];
+        let slot = &mut self.wheels[page][slot_index];
 
         let node = TimerNode {
             value,
@@ -237,7 +243,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         let node_expire_at = node.expiration;
         let (page, slot_index) = Self::page_and_slot(self.now, node_expire_at);
 
-        let slot = &mut self.slots[page][slot_index];
+        let slot = &mut self.wheels[page][slot_index];
         Self::unlink(&mut self.slab, slot, handle.index());
 
         Some(self.slab.remove(handle.index()).value)
@@ -292,6 +298,11 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         self.now = now;
     }
 
+    /// Advance timer by timer amount.
+    pub fn advance(&mut self, dt: u64) -> TimerDriverDrainIter<T, A, PAGES, PAGE_SIZE> {
+        self.advance_to(self.now + dt)
+    }
+
     /// Advance timer driver to the given time point.
     ///
     /// # Warning
@@ -304,7 +315,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
     /// Panics if the given time point is less than the current time point. Same time
     /// point doesn't cause panic, as it's meaningful for timer insertions that are
     /// *already expired*.
-    pub fn advance(&mut self, now: TimePoint) -> TimerDriverDrainIter<T, A, PAGES, PAGE_SIZE> {
+    pub fn advance_to(&mut self, now: TimePoint) -> TimerDriverDrainIter<T, A, PAGES, PAGE_SIZE> {
         assert!(now >= self.now, "time advanced backward!");
 
         // Detect all cursor advances
@@ -317,7 +328,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         page_hi = page_hi.min(PAGES - 1);
 
         Self::visit_slots(self.now, now, [0], |_, cursor| {
-            let slot = &mut self.slots[0][cursor as usize];
+            let slot = &mut self.wheels[0][cursor as usize];
 
             // Clear out the slot in any case
             let slot_head = replace(&mut slot.head, ELEM_NIL);
@@ -344,7 +355,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
         });
 
         Self::visit_slots(self.now, now, 1..=page_hi, |page, cursor| {
-            let slot = &mut self.slots[page][cursor as usize];
+            let slot = &mut self.wheels[page][cursor as usize];
             let mut slot_head = replace(&mut slot.head, ELEM_NIL);
             slot.tail = ELEM_NIL;
 
@@ -378,7 +389,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
                     let expiration = node.expiration.max(now);
                     let (new_page, new_slot) = Self::page_and_slot(now, expiration);
 
-                    let new_slot = &mut self.slots[new_page][new_slot];
+                    let new_slot = &mut self.wheels[new_page][new_slot];
                     node.next = new_slot.head;
                     node.prev = ELEM_NIL;
                     Self::assign_node_to_slot_front(&mut self.slab, new_slot, node_idx);
@@ -540,7 +551,7 @@ mod tests {
         // Should be hashed to page 0, slot 10
         let mut insert_and_compare = |expire: TimePoint, page: usize, slot: usize| {
             let h = tm.insert(idx(), expire);
-            assert_eq!(tm.slots[page][slot].head, h.index());
+            assert_eq!(tm.wheels[page][slot].head, h.index());
         };
 
         insert_and_compare(10, 0, 10);
@@ -570,9 +581,9 @@ mod tests {
         tm.insert(2, 1020);
         tm.insert(3, 1030);
 
-        assert_eq!(tm.advance(1010).next(), Some(1));
-        assert_eq!(tm.advance(1020).next(), Some(2));
-        assert_eq!(tm.advance(1030).next(), Some(3));
+        assert_eq!(tm.advance_to(1010).next(), Some(1));
+        assert_eq!(tm.advance_to(1020).next(), Some(2));
+        assert_eq!(tm.advance_to(1030).next(), Some(3));
 
         assert_eq!(tm.len(), 0);
 
@@ -588,11 +599,11 @@ mod tests {
         assert_eq!(tm.remove(h), Some(3));
         assert_eq!(tm.len(), 3);
 
-        assert_eq!(tm.advance(OFST + 310).next(), Some(2));
-        assert_eq!(tm.advance(OFST + 999).next(), None);
-        assert_eq!(tm.advance(OFST + 1411).next(), Some(4));
-        assert_eq!(tm.advance(OFST + 49133).next(), Some(1));
-        assert_eq!(tm.advance(OFST + 60000).next(), None);
+        assert_eq!(tm.advance_to(OFST + 310).next(), Some(2));
+        assert_eq!(tm.advance_to(OFST + 999).next(), None);
+        assert_eq!(tm.advance_to(OFST + 1411).next(), Some(4));
+        assert_eq!(tm.advance_to(OFST + 49133).next(), Some(1));
+        assert_eq!(tm.advance_to(OFST + 60000).next(), None);
 
         assert_eq!(tm.len(), 0);
 
@@ -604,7 +615,10 @@ mod tests {
         tm.insert(4, OFST + 1411);
 
         assert_eq!(tm.len(), 4);
-        assert_eq!(tm.advance(OFST + 60_000).collect::<Vec<_>>(), [2, 4, 1, 3]);
+        assert_eq!(
+            tm.advance_to(OFST + 60_000).collect::<Vec<_>>(),
+            [2, 4, 1, 3]
+        );
         assert_eq!(tm.len(), 0);
     }
 
@@ -624,7 +638,7 @@ mod tests {
         for _ in 0..num_iter {
             now += rng.u64(1..128);
 
-            for expired in tm.advance(now) {
+            for expired in tm.advance_to(now) {
                 assert!(active_handles.remove(&expired).is_some_and(|v| v <= now));
             }
 
@@ -640,7 +654,7 @@ mod tests {
 
         now = u64::MAX;
 
-        for expired in tm.advance(u64::MAX) {
+        for expired in tm.advance_to(u64::MAX) {
             assert!(active_handles.remove(&expired).is_some_and(|v| v <= now));
         }
 
