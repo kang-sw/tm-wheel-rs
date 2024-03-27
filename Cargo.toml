@@ -15,3 +15,6 @@ slab = { version = "0.4", optional = true }
 [features]
 default = ["std"]
 std = ["dep:slab"]
+
+[dev-dependencies]
+rand = "0.8"

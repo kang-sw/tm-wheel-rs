@@ -313,7 +313,8 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
 
         // From highest changed page ...
         let bit_diff = self.now ^ now;
-        let page_hi = 63_usize.saturating_sub(bit_diff.leading_zeros() as _) / Self::BITS;
+        let mut page_hi = 63_usize.saturating_sub(bit_diff.leading_zeros() as _) / Self::BITS;
+        page_hi = page_hi.min(PAGES - 1);
 
         Self::visit_slots(self.now, now, [0], |_, cursor| {
             let slot = &mut self.slots[0][cursor as usize];
@@ -347,7 +348,6 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
             let mut slot_head = replace(&mut slot.head, ELEM_NIL);
             slot.tail = ELEM_NIL;
 
-            // TODO: extract out `page == 0` branch. Indent too deep!
             // Rehash every item within this slot.
             while slot_head != ELEM_NIL {
                 let node_idx = slot_head;
@@ -355,6 +355,13 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
                 slot_head = node.next;
 
                 if node.expiration <= now {
+                    // XXX: Batch expiration can be handled efficiently
+                    // - `node.expiration` check becomes redundant if this `now` exceeds
+                    //   this page's maximum time range.
+                    // - To check this, create new method `Self::slot_max_time(self.now,
+                    //   page, slot)` which returns the maximum time point that this slot
+                    //   can hold.
+
                     // Append to expiration tail directly. This does not guarantee
                     // the timer expiration's incremental order, however, at least
                     // make it tends to be incremental.
@@ -399,19 +406,24 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE: usi
 
         for page in page_range {
             let page_max_time = Self::MASK << (page * Self::BITS);
-            let mut cursor = (now >> (page * Self::BITS)) & Self::MASK;
+            let cursor = (now >> (page * Self::BITS)) & Self::MASK;
 
-            let dst_cursor = if time_diff > page_max_time {
-                (cursor + Self::MASK) & Self::MASK
+            let iter_count = if time_diff > page_max_time {
+                // The time difference exceeds the page's maximum time range. Therefore,
+                // every timer item in this page will be expired.
+                1 << Self::BITS
             } else {
-                ((next_now >> (page * Self::BITS)) + 1) & Self::MASK
-                // We're going to clear out   ^^^ slots inclusively.
+                let dst = (next_now >> (page * Self::BITS)) & Self::MASK;
+                1 + if dst < cursor {
+                    (1 << Self::BITS) - cursor + dst
+                } else {
+                    dst - cursor
+                }
             };
 
             // Validate cursor position.
-            while cursor != dst_cursor {
-                visitor(page, cursor);
-                cursor = (cursor + 1) & Self::MASK;
+            for iter in 0..iter_count {
+                visitor(page, (cursor + iter) & Self::MASK);
             }
         }
     }
@@ -510,6 +522,10 @@ impl<'a, T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE:
 /* ============================================================================================== */
 #[cfg(all(test, feature = "std"))]
 mod tests {
+    use std::collections::HashMap;
+
+    use rand::prelude::{Rng, SeedableRng};
+
     use crate::TimePoint;
 
     #[test]
@@ -594,5 +610,42 @@ mod tests {
         assert_eq!(tm.len(), 0);
     }
 
-    // TODO: scaled test from generated inputs
+    // todo: scaled test from generated inputs
+    #[test]
+    fn test_many_cases() {
+        let mut rng = rand::prelude::StdRng::seed_from_u64(0);
+        let mut active_handles = HashMap::new();
+        let mut timer_id = 0;
+        let num_iter = 100000;
+        let mut now = 0u64;
+
+        // frequent enough to see page shift
+        let mut tm = crate::TimerDriver::<u32, 12, 4>::default();
+        dbg!(tm.expiration_limit());
+
+        for _ in 0..num_iter {
+            now += rng.gen_range(1..128);
+
+            for expired in tm.advance(now) {
+                assert!(active_handles.remove(&expired).is_some_and(|v| v <= now));
+            }
+
+            for _ in 0..rng.gen_range(0..5) {
+                let id = timer_id;
+                timer_id += 1;
+
+                let expire_at = now + rng.gen_range(1..10000);
+                active_handles.insert(id, expire_at);
+                tm.insert(id, expire_at);
+            }
+        }
+
+        now = u64::MAX;
+
+        for expired in tm.advance(u64::MAX) {
+            assert!(active_handles.remove(&expired).is_some_and(|v| v <= now));
+        }
+
+        assert!(active_handles.is_empty());
+    }
 }
