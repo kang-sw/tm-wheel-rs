@@ -1,7 +1,6 @@
 #![doc=include_str!("../README.md")]
 
 use core::{
-    f32::consts::E,
     mem::replace,
     num::{NonZeroU32, NonZeroU64},
 };
@@ -221,18 +220,22 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
         TimerHandle(id, NonZeroU32::new(new_node + 1).unwrap())
     }
 
-    fn assign_node_to_bucket_front(slab: &mut A, slot: &mut TimerWheelBucket, node_idx: ElemIndex) {
-        debug_assert!(slab.at(node_idx).next == slot.head);
+    fn assign_node_to_bucket_front(
+        slab: &mut A,
+        bucket: &mut TimerWheelBucket,
+        node_idx: ElemIndex,
+    ) {
+        debug_assert!(slab.at(node_idx).next == bucket.head);
 
-        if slot.head == ELEM_NIL {
-            slot.tail = node_idx;
+        if bucket.head == ELEM_NIL {
+            bucket.tail = node_idx;
         } else {
-            let head = slot.head;
+            let head = bucket.head;
             let head_node = slab.at_mut(head);
             head_node.prev = node_idx;
         }
 
-        slot.head = node_idx;
+        bucket.head = node_idx;
     }
 
     fn level_and_bucket(now: TimePoint, expires_at: TimePoint) -> (usize, usize) {
@@ -444,11 +447,84 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
 
         // From highest changed page ...
         let bit_diff = self.now ^ advance;
+
+        // Unlike the logic inside `level_and_bucket`, this method account for the bit flip of the
+        // lowest position.
         let mut page_hi = 63_usize.saturating_sub(bit_diff.leading_zeros() as _) / Self::BITS;
         page_hi = page_hi.min(LEVELS - 1);
 
-        {
+        // List of all rehash targets
+        let mut rehash_head = ELEM_NIL;
+
+        // Logic
+        // - For any wheel greater than level 0, rehash all items until next cursor + 1.
+        // - See `level_and_bucket`
+        for level in 1..=page_hi {
             // TODO: Reimplement re-hashing logic
+
+            let wheel = &mut self.wheels[level];
+            let level_bits = level * Self::BITS;
+            let mut cursor = (self.now >> level_bits) & Self::E_MASK;
+
+            // Based on above logic, current and the next cursor position MUST be empty, as the
+            // hashing method never target those two.
+            debug_assert_eq!(wheel[cursor as usize].head, ELEM_NIL);
+            debug_assert_eq!(wheel[((cursor + 1) & Self::E_MASK) as usize].head, ELEM_NIL);
+
+            // next cursor and next cursor + 1 are rehashed.
+            let next_cursor = next_tp >> level_bits;
+            let cursor_dst = (next_cursor + 1) & Self::E_MASK;
+            let mut bucket_expiration = (self.now >> level_bits) << level_bits;
+
+            loop {
+                bucket_expiration += Self::time_units(level);
+                let bucket = &mut wheel[cursor as usize];
+
+                let bucket_head = replace(&mut bucket.head, ELEM_NIL);
+                let bucket_tail = replace(&mut bucket.tail, ELEM_NIL);
+
+                if bucket_expiration >= next_tp {
+                    // Append all items in this bucket to the expiration list
+                    if expired_head == ELEM_NIL {
+                        expired_head = bucket_head;
+                        expired_tail = bucket_tail;
+                    } else {
+                        self.slab.at_mut(expired_tail).next = bucket_head;
+                        self.slab.at_mut(bucket_head).prev = expired_tail;
+
+                        expired_tail = bucket_tail;
+                    }
+                } else {
+                    // Rehash all items within this bucket.
+                    if rehash_head == ELEM_NIL {
+                        rehash_head = bucket_head;
+                    } else {
+                        self.slab.at_mut(bucket_tail).next = rehash_head;
+                        self.slab.at_mut(rehash_head).prev = bucket_tail;
+                        rehash_head = bucket_head;
+                    }
+                }
+
+                if cursor == cursor_dst {
+                    break;
+                }
+
+                cursor += 1;
+            }
+        }
+
+        // Flush pending rehash target nodes
+        while rehash_head != ELEM_NIL {
+            let node_idx = rehash_head;
+            let node = self.slab.at_mut(rehash_head);
+            rehash_head = node.next;
+
+            let (level, bucket) = Self::level_and_bucket(self.now, node.expiration);
+            let bucket = &mut self.wheels[level][bucket];
+            node.next = bucket.head;
+            node.prev = ELEM_NIL;
+
+            Self::assign_node_to_bucket_front(&mut self.slab, bucket, node_idx);
         }
 
         // update timings
@@ -579,6 +655,7 @@ impl<'a, T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE:
     for TimerDriverDrainIter<'a, T, A, PAGES, PAGE_SIZE>
 {
     fn drop(&mut self) {
+        // consume all remaining elements
         for _ in self.by_ref() {}
     }
 }
