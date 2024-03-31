@@ -450,8 +450,8 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
         // From highest changed page ...
         let bit_diff = self.now ^ next_tp;
 
-        // Unlike the logic inside `level_and_bucket`, this method account for the bit flip of the
-        // lowest position.
+        // Find the highest affected level. Any page under this level automatically affected. (i.e.
+        // carry)
         let mut page_hi = 63_usize.saturating_sub(bit_diff.leading_zeros() as _) / Self::BITS;
         page_hi = page_hi.min(LEVELS - 1);
 
@@ -474,10 +474,13 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
                 cursor.wrapping_sub(1) & Self::E_MASK
             } else {
                 let next_cursor = next_tp >> level_bits;
-                let dst = (next_cursor + 1) & Self::E_MASK;
-                dst.wrapping_sub((dst == cursor) as _) & Self::E_MASK
+                (next_cursor + 1) & Self::E_MASK
             };
 
+            debug_assert!(wheel[cursor as usize].head == ELEM_NIL);
+            cursor = (cursor + 1) & Self::E_MASK; // We can safely skip the first position
+
+            // Buckets until `next_cursor + 1` will be rehashed to lower level.
             loop {
                 let bucket = &mut wheel[cursor as usize];
 
