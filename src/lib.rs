@@ -240,7 +240,6 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
     }
 
     fn level_and_bucket(now: TimePoint, expires_at: TimePoint) -> (usize, usize) {
-        // TODO: Re-architect this.
         // - Once registered, offset time range which cannot be fit to single BIT_MASK range should
         //   be tossed to upstream level.
         // - Let's assume the PAGE_BITS is 4. then the timer item `A` with expiration 1_0000 will
@@ -463,8 +462,6 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
         // - For any wheel greater than level 0, rehash all items until next cursor + 1.
         // - See `level_and_bucket`
         for level in 1..=page_hi {
-            // TODO: Reimplement re-hashing logic
-
             let wheel = &mut self.wheels[level];
             let level_bits = level * Self::BITS;
             let mut cursor = (self.now >> level_bits) & Self::E_MASK;
@@ -687,7 +684,6 @@ mod tests {
 
                 let cursor = (self.now >> level_bits) & Self::E_MASK;
 
-                // TODO: Validate the hash position
                 for iter in 0..=Self::E_MASK {
                     let bucket_idx = (cursor + iter) & Self::E_MASK;
                     let bucket = &wheel[bucket_idx as usize];
