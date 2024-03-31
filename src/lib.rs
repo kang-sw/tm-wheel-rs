@@ -173,10 +173,11 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
     TimerDriverBase<T, A, LEVELS, WHEEL_SIZE>
 {
     pub const LEVELS: usize = LEVELS;
-    const BITS: usize = WHEEL_SIZE.trailing_zeros() as usize;
-    const MASK: u64 = WHEEL_SIZE as u64 - 1;
 
-    const E_BITS: usize = Self::BITS << 1;
+    // Number of bits in each wheel page.
+    const BITS: usize = WHEEL_SIZE.trailing_zeros() as usize;
+
+    // Extended mask to cover the overflow of the current level.
     const E_MASK: u64 = (WHEEL_SIZE << 1) as u64 - 1;
 
     pub fn new(slab: A) -> Self {
@@ -354,10 +355,10 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
     /// If there's no nearest timer in lowest level page, it'll return the nearest rehash
     /// timing which will drag down the timers from higher pages, resulting no actual
     /// timer expiration output.
-    pub fn nearest_wakeup(&mut self) -> TimeOffset {
+    pub fn nearest_wakeup(&mut self) -> Option<NonZeroU64> {
         if self.is_empty() {
             // No timers are registered ... don't even need to wakeup.
-            return TimeOffset::MAX;
+            return None;
         }
 
         // Iterate all pages from the lowest slot, until find non-empty one.
@@ -372,7 +373,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
                 let bucket = &wheel[cursor as usize];
 
                 if bucket.head != ELEM_NIL {
-                    return now + bucket_offset * Self::time_units(level);
+                    return NonZeroU64::new(now + bucket_offset * Self::time_units(level));
                 }
             }
         }
@@ -473,7 +474,8 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
                 cursor.wrapping_sub(1) & Self::E_MASK
             } else {
                 let next_cursor = next_tp >> level_bits;
-                (next_cursor + 1) & Self::E_MASK
+                let dst = (next_cursor + 1) & Self::E_MASK;
+                dst.wrapping_sub((dst == cursor) as _) & Self::E_MASK
             };
 
             loop {
@@ -752,13 +754,13 @@ mod tests {
         tm.insert(2, 1020);
         tm.insert(3, 1030);
 
-        assert_eq!(tm.nearest_wakeup(), 1010);
+        assert_eq!(tm.nearest_wakeup().unwrap().get(), 1010);
         tm.assert_valid_state();
         assert_eq!(tm.advance_to(1010).next(), Some(1));
-        assert_eq!(tm.nearest_wakeup(), 1020);
+        assert_eq!(tm.nearest_wakeup().unwrap().get(), 1020);
         tm.assert_valid_state();
         assert_eq!(tm.advance_to(1020).next(), Some(2));
-        assert_eq!(tm.nearest_wakeup(), 1030);
+        assert_eq!(tm.nearest_wakeup().unwrap().get(), 1030);
         tm.assert_valid_state();
         assert_eq!(tm.advance_to(1030).next(), Some(3));
 
@@ -778,17 +780,24 @@ mod tests {
         assert_eq!(tm.len(), 3);
 
         dbg!(tm.nearest_wakeup());
+        assert!(tm.nearest_wakeup().unwrap().get() <= OFST + 310);
         assert_eq!(tm.advance_to(OFST + 310).next(), Some(2));
         tm.assert_valid_state();
+
         dbg!(tm.nearest_wakeup());
         assert_eq!(tm.advance_to(OFST + 999).next(), None);
         tm.assert_valid_state();
+
         dbg!(tm.nearest_wakeup());
+        assert!(tm.nearest_wakeup().unwrap().get() <= OFST + 1411);
         assert_eq!(tm.advance_to(OFST + 1411).next(), Some(4));
         tm.assert_valid_state();
+
         dbg!(tm.nearest_wakeup());
+        assert!(tm.nearest_wakeup().unwrap().get() <= OFST + 49133);
         assert_eq!(tm.advance_to(OFST + 49133).next(), Some(1));
         tm.assert_valid_state();
+
         dbg!(tm.nearest_wakeup());
         assert_eq!(tm.advance_to(OFST + 60000).next(), None);
         tm.assert_valid_state();
