@@ -367,12 +367,12 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
             let wheel = &self.wheels[level];
             let now = (self.now >> level_bits) << level_bits;
 
-            for bucket_offset in 0..2 * WHEEL_SIZE {
-                let cursor = (cursor_base + bucket_offset as u64) & Self::E_MASK;
+            for bucket_offset in 0..Self::E_MASK {
+                let cursor = (cursor_base + bucket_offset) & Self::E_MASK;
                 let bucket = &wheel[cursor as usize];
 
                 if bucket.head != ELEM_NIL {
-                    return now + bucket_offset as u64 * Self::time_units(level);
+                    return now + bucket_offset * Self::time_units(level);
                 }
             }
         }
@@ -447,7 +447,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
         }
 
         // From highest changed page ...
-        let bit_diff = self.now ^ advance;
+        let bit_diff = self.now ^ next_tp;
 
         // Unlike the logic inside `level_and_bucket`, this method account for the bit flip of the
         // lowest position.
@@ -467,12 +467,6 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
             let wheel = &mut self.wheels[level];
             let level_bits = level * Self::BITS;
             let mut cursor = (self.now >> level_bits) & Self::E_MASK;
-
-            // Based on above logic, current and the next cursor position MUST be empty, as the
-            // hashing method never target those two.
-
-            // debug_assert_eq!(wheel[cursor as usize].head, ELEM_NIL);
-            // debug_assert_eq!(wheel[((cursor + 1) & Self::E_MASK) as usize].head, ELEM_NIL);
 
             // next cursor and next cursor + 1 are rehashed.
             let cursor_dst = if advance > (Self::E_MASK << level_bits) {
@@ -525,7 +519,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
                     expired_tail = node_idx;
                 }
             } else {
-                let (level, bucket) = Self::level_and_bucket(self.now, node.expiration);
+                let (level, bucket) = Self::level_and_bucket(next_tp, node.expiration);
                 let bucket = &mut self.wheels[level][bucket];
                 node.next = bucket.head;
                 node.prev = ELEM_NIL;
@@ -568,13 +562,13 @@ impl<const WHEEL_SIZE: usize> std::ops::Index<usize> for TimerWheel<WHEEL_SIZE> 
     type Output = TimerWheelBucket;
 
     fn index(&self, index: usize) -> &Self::Output {
-        &self.buckets[(index > WHEEL_SIZE) as usize][index & Self::MASK as usize]
+        &self.buckets[(index >= WHEEL_SIZE) as usize][index & Self::MASK as usize]
     }
 }
 
 impl<const WHEEL_SIZE: usize> std::ops::IndexMut<usize> for TimerWheel<WHEEL_SIZE> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.buckets[(index > WHEEL_SIZE) as usize][index & Self::MASK as usize]
+        &mut self.buckets[(index >= WHEEL_SIZE) as usize][index & Self::MASK as usize]
     }
 }
 
@@ -674,7 +668,44 @@ impl<'a, T, A: SlabAllocator<TimerNode<T>>, const PAGES: usize, const PAGE_SIZE:
 mod tests {
     use std::collections::HashMap;
 
-    use crate::TimePoint;
+    use crate::{SlabAllocator, SlabExt, TimePoint, TimerDriverBase, TimerNode, ELEM_NIL};
+
+    impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: usize>
+        TimerDriverBase<T, A, LEVELS, WHEEL_SIZE>
+    {
+        fn assert_valid_state(&self) {
+            let mut nelem = 0;
+
+            for level in 0..LEVELS {
+                let wheel = &self.wheels[level];
+                let level_bits = level * Self::BITS;
+
+                let cursor = (self.now >> level_bits) & Self::E_MASK;
+
+                // TODO: Validate the hash position
+                for iter in 0..=Self::E_MASK {
+                    let bucket_idx = (cursor + iter) & Self::E_MASK;
+                    let bucket = &wheel[bucket_idx as usize];
+                    let mut node_idx = bucket.head;
+
+                    while node_idx != ELEM_NIL {
+                        let node = self.slab.at(node_idx);
+                        node_idx = node.next;
+
+                        // let (eval_level, eval_bucket) =
+                        //     Self::level_and_bucket(self.now, node.expiration);
+                        // assert_eq!(eval_level, level);
+                        // assert_eq!(eval_bucket, bucket_idx as usize);
+                        assert!(node.expiration >= self.now);
+
+                        nelem += 1;
+                    }
+                }
+            }
+
+            assert_eq!(nelem, self.len());
+        }
+    }
 
     #[test]
     fn test_insertion_and_structure_validity() {
@@ -691,6 +722,7 @@ mod tests {
         let mut insert_and_compare = |expire: TimePoint, page: usize, slot: usize| {
             let h = tm.insert(idx(), expire);
             assert_eq!(tm.wheels[page][slot].head, h.index());
+            tm.assert_valid_state();
         };
 
         insert_and_compare(10, 0, 10);
@@ -721,12 +753,16 @@ mod tests {
         tm.insert(3, 1030);
 
         assert_eq!(tm.nearest_wakeup(), 1010);
+        tm.assert_valid_state();
         assert_eq!(tm.advance_to(1010).next(), Some(1));
         assert_eq!(tm.nearest_wakeup(), 1020);
+        tm.assert_valid_state();
         assert_eq!(tm.advance_to(1020).next(), Some(2));
         assert_eq!(tm.nearest_wakeup(), 1030);
+        tm.assert_valid_state();
         assert_eq!(tm.advance_to(1030).next(), Some(3));
 
+        tm.assert_valid_state();
         assert_eq!(tm.len(), 0);
 
         /* ------------------------------ Test Many Page & Removal ------------------------------ */
@@ -743,23 +779,32 @@ mod tests {
 
         dbg!(tm.nearest_wakeup());
         assert_eq!(tm.advance_to(OFST + 310).next(), Some(2));
+        tm.assert_valid_state();
         dbg!(tm.nearest_wakeup());
         assert_eq!(tm.advance_to(OFST + 999).next(), None);
+        tm.assert_valid_state();
         dbg!(tm.nearest_wakeup());
         assert_eq!(tm.advance_to(OFST + 1411).next(), Some(4));
+        tm.assert_valid_state();
         dbg!(tm.nearest_wakeup());
         assert_eq!(tm.advance_to(OFST + 49133).next(), Some(1));
+        tm.assert_valid_state();
         dbg!(tm.nearest_wakeup());
         assert_eq!(tm.advance_to(OFST + 60000).next(), None);
+        tm.assert_valid_state();
 
         assert_eq!(tm.len(), 0);
 
         /* ------------------------------------ Test Iterator ----------------------------------- */
         tm.reset(OFST);
         tm.insert(1, OFST + 49133);
+        tm.assert_valid_state();
         tm.insert(2, OFST + 310);
+        tm.assert_valid_state();
         tm.insert(3, OFST + 59166);
+        tm.assert_valid_state();
         tm.insert(4, OFST + 1411);
+        tm.assert_valid_state();
 
         assert_eq!(tm.len(), 4);
         assert_eq!(
@@ -782,10 +827,12 @@ mod tests {
         let mut tm = crate::TimerDriver::<u32, 12, 4>::default();
         dbg!(tm.expiration_limit());
 
-        for _ in 0..num_iter {
+        for _iter in 0..num_iter {
             now += rng.u64(1..128);
 
-            if now == 164346 {
+            tm.assert_valid_state();
+
+            if now == 1622 {
                 dbg!(now);
             }
 
@@ -805,6 +852,7 @@ mod tests {
         }
 
         now = u64::MAX;
+        tm.assert_valid_state();
 
         for expired in tm.advance_to(u64::MAX) {
             assert!(active_handles.remove(&expired).is_some_and(|v| v <= now));
