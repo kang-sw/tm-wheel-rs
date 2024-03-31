@@ -132,6 +132,8 @@ pub struct TimerDriverBase<
     now: crate::TimePoint,
     wheels: [TimerWheel<WHEEL_SIZE>; LEVELS],
     _phantom: std::marker::PhantomData<T>,
+    // TODO: For `feature="std"`, implement `occupy: BitVec` indexed array to track slot
+    // occupancy. This'll help for tracking nearest timers.
 }
 
 #[doc(hidden)]
@@ -290,9 +292,7 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
             return None;
         }
 
-        let node_expire_at = node.expiration;
-        let (level, bucket_idx) = Self::level_and_bucket(self.now, node_expire_at);
-
+        let (level, bucket_idx) = Self::level_and_bucket(self.now, node.expiration);
         let slot = &mut self.wheels[level][bucket_idx];
         Self::unlink(&mut self.slab, slot, handle.index());
 
@@ -693,10 +693,12 @@ mod tests {
                         let node = self.slab.at(node_idx);
                         node_idx = node.next;
 
-                        // let (eval_level, eval_bucket) =
-                        //     Self::level_and_bucket(self.now, node.expiration);
-                        // assert_eq!(eval_level, level);
-                        // assert_eq!(eval_bucket, bucket_idx as usize);
+                        let (eval_level, eval_bucket) =
+                            Self::level_and_bucket(self.now, node.expiration);
+                        assert_eq!(eval_level, level);
+
+                        // BUG: This assertion failure will make the `remove` behavior broken!
+                        assert_eq!(eval_bucket, bucket_idx as usize);
                         assert!(node.expiration >= self.now);
 
                         nelem += 1;
