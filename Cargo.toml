@@ -1,6 +1,6 @@
 [package]
 name = "tm-wheel"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Low-level hierachical timing wheel based timer driver implementation"
 license = "MIT"
