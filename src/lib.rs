@@ -366,8 +366,6 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
         let prev = node.prev;
         let next = node.next;
 
-        // TODO: Change this as loop, which look for actual position from current hash in downward
-
         if prev != ELEM_NIL {
             let prev_node = slab.at_mut(prev);
             prev_node.next = next;
