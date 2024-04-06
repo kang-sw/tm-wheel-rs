@@ -286,17 +286,79 @@ impl<T, A: SlabAllocator<TimerNode<T>>, const LEVELS: usize, const WHEEL_SIZE: u
 
     /// Remove given timer handle from the driver.
     pub fn remove(&mut self, handle: TimerHandle) -> Option<T> {
-        let node = self.slab.get(handle.index())?;
+        let node_idx = handle.index();
+        let node = self.slab.get(node_idx)?;
 
         if node.id.get() != handle.id() {
             return None;
         }
 
-        let (level, bucket_idx) = Self::level_and_bucket(self.now, node.expiration);
-        let slot = &mut self.wheels[level][bucket_idx];
-        Self::unlink(&mut self.slab, slot, handle.index());
+        let (mut level, mut bucket_idx) = Self::level_and_bucket(self.now, node.expiration);
+
+        // As soon as any advancement occurs, internal hash state of buckets larger than wheel
+        // level 0 will be invalidated. When we remove a timer item, this doesn't matter if the
+        // timer is between two other timer nodes; it's just linked list removal operation.
+        //
+        // However, if one of fwd/bwd link is NIL, we have to validate the bucket's head/tail
+        // pointer. Since the bucket hash constantly gets invalidated over advancement, we can't
+        // rely on the evaluation result of `Self::level_and_bucket`. Therefore, here, we perform
+        // linear search to find the valid bucket, which is pointing to the node that is being
+        // removed.
+        //
+        // We only have to search upward; as the timer advancement only reduces remaining time
+        (level, bucket_idx) = if node.prev == ELEM_NIL {
+            Self::climb_cursor_until(self.now, &self.wheels, level, bucket_idx, |bucket| {
+                bucket.head == node_idx
+            })
+        } else if node.next == ELEM_NIL {
+            Self::climb_cursor_until(self.now, &self.wheels, level, bucket_idx, |bucket| {
+                bucket.tail == node_idx
+            })
+        } else {
+            (level, bucket_idx)
+        };
+
+        Self::unlink(
+            &mut self.slab,
+            &mut self.wheels[level][bucket_idx],
+            node_idx,
+        );
 
         Some(self.slab.remove(handle.index()).value)
+    }
+
+    fn climb_cursor_until(
+        now: TimePoint,
+        wheels: &[TimerWheel<WHEEL_SIZE>],
+        mut level: usize,
+        mut bucket_idx: usize,
+        pred: impl Fn(&TimerWheelBucket) -> bool,
+    ) -> (usize, usize) {
+        'found: loop {
+            let wheel = &wheels[level];
+            let cursor_end = bucket_idx;
+
+            loop {
+                let bucket = &wheel[bucket_idx];
+                if pred(bucket) {
+                    break 'found;
+                }
+
+                bucket_idx = (bucket_idx + 1) & Self::E_MASK as usize;
+                if bucket_idx == cursor_end {
+                    break;
+                }
+            }
+
+            level += 1;
+
+            // From zero index bucket of next level ...
+            bucket_idx = ((now >> (level * Self::BITS)) & Self::E_MASK) as _;
+
+            assert!(level < LEVELS);
+        }
+
+        (level, bucket_idx)
     }
 
     fn unlink(slab: &mut A, bucket: &mut TimerWheelBucket, node_idx: ElemIndex) {
@@ -700,7 +762,7 @@ mod tests {
 
                         // Evaluated level and bucket can slightly differ from its desired(i.e.
                         // ideal) hash position. Following is the least guaran
-                        assert!(eval_level.abs_diff(level) <= 1);
+                        assert!(level - eval_level <= 1);
                         assert!(node.expiration >= self.now);
 
                         nelem += 1;
@@ -713,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn test_insertion_and_structure_validity() {
+    fn insertion_and_structure_validity() {
         let mut tm = crate::TimerDriver::<u32, 4, 16>::default();
         let mut idx = {
             let mut gen = 0;
@@ -748,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn test_advance_expiration() {
+    fn advance_expiration() {
         let mut tm = crate::TimerDriver::<u32, 4, 16>::default();
 
         /* ----------------------------------- Test First Page ---------------------------------- */
@@ -828,7 +890,7 @@ mod tests {
 
     // todo: scaled test from generated inputs
     #[test]
-    fn test_many_cases() {
+    fn insert_advance_many() {
         let mut rng = fastrand::Rng::with_seed(0);
         let mut active_handles = HashMap::new();
         let mut timer_id = 0;
@@ -843,10 +905,6 @@ mod tests {
             now += rng.u64(1..128);
 
             tm.assert_valid_state();
-
-            if now == 1622 {
-                dbg!(now);
-            }
 
             for expired in tm.advance_to(now) {
                 let expiration = active_handles.remove(&expired).unwrap();
@@ -871,5 +929,55 @@ mod tests {
         }
 
         assert!(active_handles.is_empty());
+    }
+
+    #[test]
+    fn insert_advance_remove_many() {
+        let mut rng = fastrand::Rng::with_seed(0);
+        let mut active_timers = HashMap::new();
+        let mut timer_id = 0;
+        let num_iter = 300000;
+        let mut now = 0u64;
+
+        // frequent enough to see page shift
+        let mut tm = crate::TimerDriver::<u32, 12, 4>::default();
+        dbg!(tm.expiration_limit());
+
+        for _iter in 0..num_iter {
+            now += rng.u64(1..128);
+
+            tm.assert_valid_state();
+
+            // Remove random timer
+            if !tm.is_empty() {
+                let key = *active_timers.keys().next().unwrap();
+                let (_, handle) = active_timers.remove(&key).unwrap();
+                assert_eq!(tm.remove(handle), Some(key));
+            }
+
+            // Advance random amount of time
+            for expired in tm.advance_to(now) {
+                let (expiration, _) = active_timers.remove(&expired).unwrap();
+                assert!(expiration <= now);
+            }
+
+            for _ in 0..rng.usize(0..10) {
+                let id = timer_id;
+                timer_id += 1;
+
+                let expire_at = now + rng.u64(1..10000);
+                let handle = tm.insert(id, expire_at);
+                active_timers.insert(id, (expire_at, handle));
+            }
+        }
+
+        now = u64::MAX;
+        tm.assert_valid_state();
+
+        for expired in tm.advance_to(u64::MAX) {
+            assert!(active_timers.remove(&expired).is_some_and(|v| v.0 <= now));
+        }
+
+        assert!(active_timers.is_empty());
     }
 }
